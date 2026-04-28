@@ -180,7 +180,23 @@ from .Rom import CTJoTProcedurePatch
 #            pre-existing None-check bug in _track_locations where
 #            location_data could be passed unguarded to
 #            int.from_bytes.
-__version__ = "1.4.6"
+#   1.4.7 -- fix: AP fill error "more locations than items" when
+#            chronosanity is OFF and any of the location-only flag-
+#            gated KI spots are enabled (add_bekkler_spot,
+#            add_cyrus_grave_spot, add_ozzie_fort_spot,
+#            add_sun_keep_spot). These flags add a LOCATION to the
+#            YAML's region_list but reuse existing KI items in
+#            cjot-beta -- they don't define new KI item types like
+#            Tools/JetsOfTime/Race Log/Bike Key/Seed do. v1.4.5's
+#            chronosanity-off branch skipped all item-pool padding,
+#            leaving these locations unfillable. Now: when
+#            chronosanity is off, count YAML region_list locations
+#            and top up with filler items so item count matches
+#            location count. Char/victory events excluded from the
+#            count (they have locked items). Reproduced with the
+#            user's YAML at: bekkler+cyrus+rocksanity, fill failed
+#            on slot Skuldier_CT (22 locations, 21 items).
+__version__ = "1.4.7"
 
 ctjot_logger = logging.getLogger("Jets of Time")
 
@@ -353,10 +369,24 @@ class CTJoTWorld(World):
                 tier_loc = self.multiworld.random.choice(all_locations)
                 items.append(self._item_manager.get_random_item_for_location(
                     tier_loc, difficulty, tab_treasures, self.multiworld, self.player))
-        # else: chronosanity OFF -- chests stay local (vanilla cjot-beta
-        # randomization, never multiworld). Item pool stays at exactly the
-        # YAML KI count; no chest-filler padding needed because no chest
-        # locations exist on the AP side.
+        else:
+            # Chronosanity OFF: chests stay local (no chest-filler padding
+            # needed). But flag-gated KI locations like Bekkler / Cyrus /
+            # Ozzie / Sun Keep add LOCATIONS to region_list without adding
+            # corresponding items to the items pool (cjot-beta treats those
+            # spots as new chests for existing KIs, not as new KI types).
+            # Without balancing here, AP fill errors with
+            # "more locations than items".
+            #
+            # Count YAML region_list locations and top up with filler items
+            # to match. Char/victory event locations have locked items and
+            # don't count toward fillable locations.
+            regions_from_config = self.options.region_list.value
+            yaml_loc_count = sum(
+                len(locs) for locs in regions_from_config.values())
+            items_short = yaml_loc_count - len(items)
+            for _ in range(max(0, items_short)):
+                items.append(self.create_item(self.get_filler_item_name()))
 
         # Add the selected items to the multiworld item pool
         self.multiworld.itempool += items
