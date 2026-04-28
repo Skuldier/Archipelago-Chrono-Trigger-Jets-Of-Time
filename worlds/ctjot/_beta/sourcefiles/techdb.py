@@ -1,0 +1,1785 @@
+# TODO List:
+#  - Make a read db method that reads pointers/counts from the rom itself.
+#    Pointers are easy, counts are harder to determine but should be readable
+#    from hardcoded loop bounds.
+
+from __future__ import annotations
+from typing import Optional
+import typing
+
+from byteops import get_record, set_record, \
+    get_value_from_bytes, to_little_endian, to_file_ptr, to_rom_ptr,\
+    file_ptr_from_rom
+import ctenums
+import ctrom
+import ctstrings
+from cttypes import SizedBinaryData
+import cttechtypes as ctt
+import pctech
+from techrefs import fix_tech_refs
+
+import freespace
+
+SizedBinaryDataT = typing.TypeVar('SizedBinaryDataT', bound=SizedBinaryData)
+
+class TechDB:
+    control_size = 0xB
+    effect_size = 0xC
+    gfx_size = 0x7
+    target_size = 0x2
+    bat_grp_size = 0x3
+    menu_grp_size = 0x1
+    name_size = 0xB
+    desc_ptr_size = 0x2
+    lrn_req_size = 0x3
+    lrn_ref_size = 0x5
+    mp_size = 0x1
+    atb_pen_size = 0x1
+
+    def __init__(self):
+        self.controls = bytearray([])
+        self.control_count = 0
+        self.control_start = 0
+
+        self.effects = bytearray([])
+        self.effect_count = 0
+        self.effect_start = 0
+
+        self.gfx = bytearray([])
+        self.gfx_count = 0
+        self.gfx_start = 0
+
+        self.targets = bytearray([])
+        self.target_count = 0
+
+        self.target_start = 0
+        self.bat_grps = bytearray([])
+        self.bat_grp_count = 0
+        self.bat_grp_start = 0
+
+        self.menu_grps = bytearray([])
+        self.menu_grp_count = 0
+        self.menu_grp_start = 0
+
+        self.names = bytearray([])
+        self.name_count = 0
+        self.name_start = 0
+
+        self.desc_start = 0
+        self.descs = bytearray([])
+
+        self.desc_ptrs = bytearray([])
+        self.desc_ptr_count = 0
+        self.desc_ptr_start = 0
+
+        self.techs_learned = bytearray([])
+        self.techs_learned_start = 0
+        self.orig_techs_learned_start = 0
+
+        self.lrn_reqs = bytearray([])
+        self.lrn_req_count = 0x38
+        self.lrn_req_start = 0
+
+        self.lrn_refs = bytearray([])
+        self.lrn_ref_count = 0x19
+        self.lrn_ref_start = 0
+
+        self.mps = bytearray([])
+        self.mp_count = 0x39
+        self.mp_start = 0
+
+        self.menu_mp_reqs = bytearray([])
+        self.menu_req_start = 0
+
+        self.group_sizes = bytearray([])
+        self.group_sizes_start = 0
+
+        self.atb_pens = bytearray([])
+        self.atb_pen_count = 0
+        self.atb_pen_start = 0
+
+        self.group_used = bytearray([])
+        self.first_dual_grp = 0
+        self.first_trip_grp = 0
+        self.first_rock_grp = 0
+
+        self.first_trip_tech = 0
+        self.first_dual_tech = 0
+        self.first_rock_tech = 0
+
+        self.num_techs = 0
+
+        self.menu_usable_ids = {}
+        self.pc_target = bytearray()
+
+        self.rock_types = bytearray()
+
+    @staticmethod
+    def read_block_from_ctrom(
+            ct_rom: ctrom.CTRom,
+            block_type: typing.Type[SizedBinaryDataT],
+            num_records: int
+    ) -> bytearray:
+        num_bytes = block_type.SIZE*num_records
+        rom_rw = block_type.ROM_RW
+
+        if rom_rw is None:
+            raise ValueError(f"{block_type} has no RomRW")
+
+        data_b = rom_rw.read_data_from_ctrom(ct_rom, num_bytes, 0)
+        return bytearray(data_b)
+
+    @staticmethod
+    def make_generator(
+            data: bytes,
+            num_records: Optional[int],
+            data_type: typing.Type[SizedBinaryDataT],
+    ) -> typing.Iterator[SizedBinaryDataT]:
+        '''
+        Given bytes-like data that is arranged in records of type data_type,
+        return an iterator to iterate through the data, returning each
+        record as the desired type.
+        '''
+        if data_type.SIZE is None:
+            raise ValueError("data_type does not have a fixed size")
+
+        if num_records is None:
+            if len(data) % data_type.SIZE != 0:
+                raise ValueError("num_records is None and data_type.SIZE "
+                                 "does not divide len(data)")
+            num_records = len(data) // data_type.SIZE
+        elif len(data) < data_type.SIZE*num_records:
+            raise ValueError(
+                f"Insufficient data to read {num_records} records"
+            )
+
+        return (
+            data_type(get_record(data, ind, data_type.SIZE))
+            for ind in range(num_records)
+        )
+
+    @staticmethod
+    def read_desc_ptrs_and_descs_from_ctrom(
+        ct_rom: ctrom.CTRom,
+        num_ptrs: Optional[int] = None
+    ) -> typing.Tuple[bytearray, bytearray]:
+
+        if num_ptrs is None:
+            num_techs = ctt.get_total_tech_count(ct_rom)
+            num_ptrs = num_techs + 4
+
+        desc_ptrs = TechDB.read_block_from_ctrom(
+            ct_rom, ctt.PCTechDescriptionPointer, num_ptrs
+        )
+
+        desc_ptr_gen = TechDB.make_generator(
+            desc_ptrs, num_ptrs, ctt.PCTechDescriptionPointer
+        )
+
+        rom_rw = ctt.PCTechDescriptionPointer.ROM_RW
+        start = rom_rw.get_data_start_from_ctrom(ct_rom)
+        bank = start & 0xFF0000
+
+        descs = bytearray()
+        new_desc_ptrs = bytearray()
+        cur_pos = 0
+
+        for desc_ptr in desc_ptr_gen:
+            ptr = desc_ptr.pointer + bank
+            desc = ctt.read_tech_desc_from_ctrom_address(ct_rom, ptr)
+            desc_ptr.pointer = cur_pos
+            cur_pos += len(desc)
+            new_desc_ptrs.extend(desc_ptr)
+            descs.extend(desc)
+
+        return new_desc_ptrs, descs
+
+    @staticmethod
+    def read_menu_groups_from_ctrom(ct_rom: ctrom.CTRom) -> bytearray:
+        rom_buf = ct_rom.rom_data.getbuffer()
+        menu_grp_start = file_ptr_from_rom(rom_buf, 0x02BCE9)
+        rock_grp_start = file_ptr_from_rom(rom_buf, 0x3FF97B)
+        num_rock_techs = rom_buf[0x3FF9B5]
+
+        menu_grp_count = rock_grp_start - menu_grp_start + num_rock_techs
+
+        return bytearray(
+            rom_buf[menu_grp_start: menu_grp_start+menu_grp_count]
+        )
+
+    @classmethod
+    def read_from_ctrom(cls, ct_rom: ctrom.CTRom):
+        '''
+        Read a TechDB from a CTRom.
+
+        This is the preferred way to read a CTRom.
+        '''
+        rom = ct_rom.rom_data
+
+        # Control Headers
+        num_techs = ctt.get_total_tech_count(ct_rom)
+        control_count = num_techs + 7  # techs + 7 attack headers
+        controls = TechDB.read_block_from_ctrom(
+            ct_rom, ctt.PCTechControlHeader, control_count
+        )
+
+        # Effect Headers
+        # Determine maximum effect index used in a control header.
+        control_gen = TechDB.make_generator(controls, control_count,
+                                            ctt.PCTechControlHeader)
+
+        max_eff_ind = max(control.get_effect_index(ind)
+                          for control in control_gen
+                          for ind in range(3))
+        effect_count = max_eff_ind + 1
+        effects = TechDB.read_block_from_ctrom(
+            ct_rom, ctt.PCTechEffectHeader, effect_count
+        )
+
+        # Battle Groups
+        control_gen = TechDB.make_generator(controls, control_count,
+                                            ctt.PCTechControlHeader)
+        max_battle_group_ind = max(
+            control.battle_group_id for control in control_gen
+        )
+        battle_group_count = max_battle_group_ind + 1
+        battle_groups = TechDB.read_block_from_ctrom(
+            ct_rom, ctt.PCTechBattleGroup, battle_group_count
+        )
+
+        # Graphics
+        # Graphics count is #techs + 4 (Other graphics like running away)
+        gfx_count = control_count + 4
+        gfx = TechDB.read_block_from_ctrom(
+            ct_rom, ctt.PCTechGfxHeader, gfx_count
+        )
+
+        # Tech Target Data.  One per tech.
+        target = TechDB.read_block_from_ctrom(
+            ct_rom, ctt.PCTechTargetData, num_techs)
+
+        # Names
+        # Names use ctstrings.CTNameString, not derived from BinaryData so
+        # we do the read manually.
+        name_rw = ctt.get_tech_name_romrw()
+        name_size, name_count = 0x0B, num_techs
+        names = name_rw.read_data_from_ctrom(
+            ct_rom, name_size*name_count, 0
+        )
+
+        # Desc Ptrs
+        # 4 Extra - Can't run, tech menu pages.
+        desc_ptrs, descs = TechDB.read_desc_ptrs_and_descs_from_ctrom(
+            ct_rom, num_techs + 4)
+
+        menu_groups = TechDB.read_menu_groups_from_ctrom(ct_rom)
+        num_rock_techs = ctt.get_rock_tech_count(ct_rom)
+
+        # Learn Reqs
+        # All techs but single (0x39) and rocks
+        learn_req_count = num_techs - 0x39 - num_rock_techs
+        learn_reqs = TechDB.read_block_from_ctrom(
+            ct_rom, ctt.PCTechLearnRequirements, learn_req_count
+        )
+
+    @staticmethod
+    def get_default_db_file(filename):
+        with open(filename, 'rb') as infile:
+            rom = bytearray(infile.read())
+            return TechDB.get_default_db(rom)
+
+    @staticmethod
+    def get_default_db(vanilla_rom):
+        db = TechDB.db_from_rom(vanilla_rom,
+                                0x0C1BEB, 0x7C,
+                                0x0C213F, 0x45,
+                                0x0D45A6, 0x80,
+                                0x0C1ACB, 0x75,
+                                0x0C249F, 0x32,
+                                0x0C2963, 0x25,
+                                0x0C15C4, 0x75,
+                                0x0C3A09, 0x79,
+                                0x0C3B0D, 0x0C43AF,
+                                0x0C0230,
+                                # 0x0C27F7, 0x38,
+                                # Three weird bytes between lrn_ref and lrn_req
+                                # I mistook them for a lrn_req
+                                0x0C27FA, 0x37,
+                                0x0C2778, 0x19,
+                                0x0C253B, 0x45,
+                                0x0C28DB, 0x0C2962,
+                                0x02BD40, 0x25,
+                                0x0C2BDC, 0x75+15)
+
+        # TODO:  Move all of this stuff into the basic db_from_rom function
+        # TODO:  Change this to read pointers from the actual rom.
+        db.menu_usable_ids = [False]*db.control_count
+        for x in [0x09, 0x0C, 0x0F, 0x1A, 0x1D, 0x21, 0x24, 0x27, 0x29]:
+            db.menu_usable_ids[x] = True
+
+        # Fix the "learned fire whirl" bug
+        db.lrn_refs[2] = 0x3
+
+        # Record which techs have pc-specific targetting
+        for i in range(0, db.target_count):
+            start = 2*i
+            if db.targets[start] in {0x0D, 0x13, 0x14}:  # Based around Robo
+                db.pc_target[i] = 3
+            elif db.targets[start] in {0x1B}:  # Based around Magus
+                db.pc_target[i] = 6
+            else:
+                db.pc_target[i] = 0xFF
+
+        db.first_dual_tech = 0x39
+        db.first_trip_tech = 0x66
+        db.first_rock_tech = 0x70
+        db.num_techs = 0x75
+
+        # Record which rocks have a corresponding tech in the db.
+        # For vanilla, of course all rocks are used
+        db.rock_types = bytearray.fromhex('00 01 02 03 04')
+
+        return db
+
+    @staticmethod
+    def db_from_rom_internal(rom: bytes):
+
+        # Controls
+        # Start ptr from techrefs (plenty of options)
+        control_start = file_ptr_from_rom(rom, 0x01CBA1)
+
+        # Control count is based on the control index of Magus' basic attack.
+        # It should be the last control header, so count is that + 1.
+        magus_atk_id = rom[0x0C2589]
+        control_count = magus_atk_id + 1
+        num_techs = control_count - 7
+
+        # Effects
+        # Start ptr from techrefs
+        effect_start = file_ptr_from_rom(rom, 0x01BF96)
+
+        # Effect count has to come by looking at the control headers and
+        # finding the max index
+        controls = \
+            rom[control_start:control_start+TechDB.control_size*control_count]
+
+        # Get effect indices (bytes 5,6,7) from each control header.
+        # And with 0x7F because the x80 bit encodes whether the effect is just
+        # used for mp.
+        # Take the max.
+        max_eff = max(controls[i] & (0x7F)
+                      for i in range(len(controls))
+                      if (i % TechDB.control_size) in {5, 6, 7})
+        effect_count = max_eff+1
+
+        # Graphics
+        # Start ptr from techrefs
+        gfx_start = file_ptr_from_rom(rom, 0x0145BC)
+
+        # The gfx count is number of tech gfx + fixed other graphics.
+        # The difference between #gfx and #ctl should be fixed.
+        # Vanilla: (0x80 gfx headers - 0x7C controls = 4)
+        gfx_count = control_count + 4
+
+        # Targetting Data
+        # Start ptr from techrefs
+
+        target_start = file_ptr_from_rom(rom, 0x1C25A)
+
+        # Targetting data is one per tech
+        target_count = num_techs
+
+        # Battle groups
+        # Start ptr from techrefs
+        bat_grp_start = file_ptr_from_rom(rom, 0x1CBAE)
+
+        # Count is like effects, but the battle group index is byte#0 & 7F
+        max_bat_grp = max(controls[TechDB.control_size*i] & 0x7F
+                          for i in range(control_count))
+
+        bat_grp_count = max_bat_grp+1
+
+        # Menu groups
+        # Start pointer from techrefs
+        menu_grp_start = file_ptr_from_rom(rom, 0x02BCE9)
+
+        # The count is trickier.
+        # Start of rock group section is here:
+        rock_grp_start = file_ptr_from_rom(rom, 0x3FF97B)
+        num_rock_techs = rom[0x3FF9B5]
+
+        menu_grp_count = rock_grp_start - menu_grp_start + num_rock_techs
+
+        # Names
+        # Info from techrefs
+        name_offset = get_value_from_bytes(rom[0x010B6A:0x010B6A+2])
+        name_bank = rom[0x010B75]
+
+        name_start = to_file_ptr(name_bank << 16) + name_offset
+
+        # count for each tech (not basic attack)
+        name_count = num_techs
+
+        # Desc Ptrs
+        # Info from techrefs
+        desc_ptr_offset = get_value_from_bytes(rom[0x02BE64:0x02BE64+2])
+        desc_ptr_bank = rom[0x02BE6A]
+        desc_ptr_start = to_file_ptr((desc_ptr_bank << 16) + desc_ptr_offset)
+
+        # one desc ptr per tech + 4 extras for menu text and "can't run away"
+        desc_ptr_count = num_techs + 4
+
+        # Tech Descriptions
+        # We are going to do a very dangerous thing and assume the desc_ptrs
+        # are in order.  They are in vanilla, and I don't change this!  But
+        # this may break if a foreign rom is introduced.
+
+        # Desc ptrs and descs must be in the same bank.
+        # This is the truth!  This is my belief!...At least for now...
+        first_ptr = get_value_from_bytes(rom[desc_ptr_start:desc_ptr_start+2])
+        desc_start = to_file_ptr((desc_ptr_bank << 16) + first_ptr)
+
+        # Get desc_end by following the last ptr until 00
+        last_ptr_st = desc_ptr_start+TechDB.desc_ptr_size*(desc_ptr_count-1)
+        last_ptr_b = rom[last_ptr_st:last_ptr_st + TechDB.desc_ptr_size]
+        last_ptr = get_value_from_bytes(last_ptr_b)
+
+        last_desc_start = to_file_ptr((desc_ptr_bank << 16) + last_ptr)
+
+        cur = last_desc_start
+        while rom[cur] != 0:
+            cur += 1
+
+        desc_end = cur + 1
+
+        # Techs_learned
+        stat_bank = rom[0x02958E]
+        techs_learned_start = to_file_ptr((stat_bank << 16) + 0x230)
+
+        # Learn Refs
+        lrn_ref_bank = rom[0x01F26A+3]
+        lrn_ref_off = get_value_from_bytes(rom[0x01F261:0x01F261+2])
+        lrn_ref_start = to_file_ptr((lrn_ref_bank << 16) + lrn_ref_off)
+
+        # There should be a lrn_ref for each non-rock, non-single  menu group
+        lrn_ref_count = menu_grp_count - num_rock_techs - 7
+
+        # Learn Reqs
+        lrn_req_bank = rom[0x01F595+3]
+
+        # Again, dangerous assumption that pointers are ordered.  They are in
+        # vanilla, and I keep them ordered too.
+        first_ptr = get_value_from_bytes(rom[lrn_ref_start+3:lrn_ref_start+5])
+        lrn_req_start = to_file_ptr((lrn_req_bank << 16) + first_ptr)
+
+        # each dual non-rock trip has an entry
+        lrn_req_count = num_techs - 1 - 7*8 - num_rock_techs
+
+        # Mps
+        mp_start = file_ptr_from_rom(rom, 0x02BC4E)
+
+        # one mp per effect
+        mp_count = effect_count
+
+        # Menu reqs
+        menu_mp_start = file_ptr_from_rom(rom, 0x3FF8F7)
+
+        menu_mp_rock_start = file_ptr_from_rom(rom, 0x3FF98D)
+        menu_mp_end = menu_mp_rock_start + 3*num_rock_techs
+
+        # for later:
+        menu_mp_trip_start = file_ptr_from_rom(rom, 0x3FF948)
+        num_trip_techs = (menu_mp_end - menu_mp_trip_start) // 3
+
+        # Group starts
+        group_begin_start = file_ptr_from_rom(rom, 0x02BD18)
+
+        # one per menu group
+        group_begin_count = menu_grp_count
+
+        # ATB Penalties
+        atb_pen_start = file_ptr_from_rom(rom, 0x01BDF6)
+
+        # Each tech has an entry, triple techs have two
+        atb_pen_count = num_techs+num_trip_techs
+
+        return TechDB.db_from_rom(rom,
+                                  control_start, control_count,
+                                  effect_start, effect_count,
+                                  gfx_start, gfx_count,
+                                  target_start, target_count,
+                                  bat_grp_start, bat_grp_count,
+                                  menu_grp_start, menu_grp_count,
+                                  name_start, name_count,
+                                  desc_ptr_start, desc_ptr_count,
+                                  desc_start, desc_end,
+                                  techs_learned_start,
+                                  lrn_req_start, lrn_req_count,
+                                  lrn_ref_start, lrn_ref_count,
+                                  mp_start, mp_count,
+                                  menu_mp_start, menu_mp_end,
+                                  group_begin_start, group_begin_count,
+                                  atb_pen_start, atb_pen_count)
+
+    # Give a bunch of pointers to where data is on the rom and shove it all
+    # Into a TechDB.
+    @staticmethod
+    def db_from_rom(rom: bytes,
+                    control_start: int, control_count: int,
+                    effect_start: int, effect_count: int,
+                    gfx_start: int, gfx_count: int,
+                    target_start: int, target_count: int,
+                    bat_grp_start: int, bat_grp_count: int,
+                    menu_grp_start: int, menu_grp_count: int,
+                    name_start: int, name_count: int,
+                    desc_ptr_start: int, desc_ptr_count: int,
+                    desc_start: int, desc_end: int,
+                    lrn_start: int,
+                    lrn_req_start: int, lrn_req_count: int,
+                    lrn_ref_start: int, lrn_ref_count: int,
+                    mp_start: int, mp_count: int,
+                    menu_mp_start: int, menu_mp_end: int,
+                    group_length_start: int, group_length_count: int,
+                    atb_pen_start: int, atb_pen_count: int):
+
+        db = TechDB()
+
+        control_end = control_start + TechDB.control_size*control_count
+        db.controls = bytearray(rom[control_start:control_end])
+        db.control_count = control_count
+        db.control_start = control_start
+
+        effect_end = effect_start + TechDB.effect_size*effect_count
+        db.effects = bytearray(rom[effect_start:effect_end])
+        db.effect_count = effect_count
+        db.effect_start = effect_start
+
+        gfx_end = gfx_start+TechDB.gfx_size*gfx_count
+        db.gfx = bytearray(rom[gfx_start:gfx_end])
+        db.gfx_count = gfx_count
+        db.gfx_start = gfx_start
+
+        target_end = target_start+TechDB.target_size*target_count
+        db.targets = bytearray(rom[target_start:target_end])
+        db.target_count = target_count
+        db.target_start = target_start
+
+        bat_grp_end = bat_grp_start + TechDB.bat_grp_size*bat_grp_count
+        db.bat_grps = bytearray(rom[bat_grp_start:bat_grp_end])
+        db.bat_grp_count = bat_grp_count
+        db.bat_grp_start = bat_grp_start
+
+        menu_grp_end = menu_grp_start+TechDB.menu_grp_size*menu_grp_count
+
+        # Also sets up some thresholds for dual/triple/rock groups
+        # Takes care of counts too.
+
+        # TODO: There's a little problem here because it's not easy to
+        # determine how many rock groups there are by looking at the rom.
+        # We just assume that it's 5 when reading from the rom, but this
+        # should be redone if we want to correctly read an altered db
+        db._set_menu_grps(bytearray(rom[menu_grp_start:menu_grp_end]), 5)
+        db.menu_grp_start = menu_grp_start
+
+        names_end = name_start + TechDB.name_size*name_count
+        db.names = bytearray(rom[name_start:names_end])
+        db.name_count = name_count
+        db.name_start = name_start
+
+        desc_ptr_end = desc_ptr_start+TechDB.desc_ptr_size*desc_ptr_count
+        db.desc_ptrs = bytearray(rom[desc_ptr_start:desc_ptr_end])
+        db.desc_ptr_count = desc_ptr_count
+        db.desc_ptr_start = desc_ptr_start
+
+        db.desc_start = desc_start
+        db.descs = bytearray(rom[desc_start:desc_end])
+
+        # 7 bytes for current tech levels and then one byte per menu group
+        techs_learned_size = 7+menu_grp_count
+        db.techs_learned = bytearray(
+            rom[lrn_start:lrn_start+techs_learned_size]
+        )
+        db.techs_learned_start = lrn_start
+
+        lrn_req_end = lrn_req_start + lrn_req_count*TechDB.lrn_req_size
+        db.lrn_reqs = bytearray(rom[lrn_req_start:lrn_req_end])
+        db.lrn_req_count = lrn_req_count
+        db.lrn_req_start = lrn_req_start
+
+        lrn_ref_end = lrn_ref_start+TechDB.lrn_ref_size*lrn_ref_count
+        db.lrn_refs = bytearray(rom[lrn_ref_start:lrn_ref_end])
+        db.lrn_ref_count = lrn_ref_count
+        db.lrn_ref_start = lrn_ref_start
+
+        db.mps = bytearray(rom[mp_start:mp_start+mp_count])
+        db.mp_count = mp_count
+        db.mp_start = mp_start
+
+        db.menu_mp_reqs = bytearray(rom[menu_mp_start:menu_mp_end])
+        db.menu_req_start = menu_mp_start
+
+        group_length_end = group_length_start+group_length_count
+        db.group_sizes = bytearray(rom[group_length_start:group_length_end])
+        db.group_sizes_start = group_length_start
+
+        atb_pen_end = atb_pen_start+TechDB.atb_pen_size*atb_pen_count
+        db.atb_pens = bytearray(rom[atb_pen_start:atb_pen_end])
+        db.atb_pen_count = atb_pen_count
+        db.atb_pen_start = atb_pen_start
+
+        db.pc_target = bytearray([0xFF]*db.control_count)
+
+        # Try to get a menu-usable implementation here.
+        db.menu_usable_ids = [False]*db.control_count
+
+        # $FF/F82E A9 80       LDA #$80 <-- how the menu routine should start
+        # $FF/F82E 22 XX XX XX JSL $XXXXXX  <-- how it looks if expanded
+
+        rt_start = rom[0x3FF82E]
+        pos = 0
+
+        if rt_start == 0xA9:
+            # Not expanded, still starting with the LDA #$80
+            pos = 0x3FF830  # Start of TSB block
+
+        elif rt_start == 0x22:
+            # Expanded, starts with a JSL
+            rt_addr = get_value_from_bytes(rom[rt_start+1: rt_start+4])
+            rt_addr = to_file_ptr(rt_addr)
+
+            # new rt has the LDA #$80 (2 bytes) and then starts the TSBs
+            pos = rt_addr+2
+
+        while rom[pos] == 0x0C:
+            db.menu_usable_ids[rom[pos+1]] = True
+            pos += 3
+
+        db.orig_techs_learned_start = db.techs_learned_start
+
+        return db
+
+    # For techs to be learned after battle, the learn refs need to point to
+    # the right places in the learn reqs.  If the learn reqs are going to move
+    # in memory or techs get shuffled, the learn refs need to be recomputed.
+    def rewrite_lrn_refs(self):
+
+        # You have to add 3 because of a blank "tech 0" entry in the lrn_reqs
+        # addr = self.lrn_req_start % 0x010000+3
+
+        # No you don't.
+        addr = self.lrn_req_start % 0x010000
+
+        for i in range(0, self.lrn_ref_count):
+            start = i*TechDB.lrn_ref_size
+            grp_ind = i+7
+            if (grp_ind < self.first_trip_grp):
+                group_len = 3
+            else:
+                group_len = 1
+
+            self.lrn_refs[start:start+3] = [self.menu_grps[grp_ind],
+                                            self.group_sizes[grp_ind],
+                                            group_len]
+
+            self.lrn_refs[start+3:start+5] = to_little_endian(addr, 2)
+
+            addr += group_len*TechDB.lrn_req_size
+
+    @staticmethod
+    def bat_to_menu(bat_grp):
+        '''Converts three element battle group into a bitmask (menu group).'''
+        menu_grp = 0
+        for pc_index in bat_grp:
+            if pc_index != 0xFF:
+                menu_grp = menu_grp | (0x80 >> pc_index)
+
+        return menu_grp
+
+    # Add new effect header unless already present.  Return index to the header
+    # in the data.
+    # Used when adding techs to a db.  In current implementation we should
+    # never actually add a new header.
+    def add_effect_header(self, new_effect: bytes):
+        '''
+        Add a new effect header to the db unless already present.
+        Returns an index to the new header (effect index, not byte offset).
+
+        This is needed when adding new techs.  A tech's control header needs
+        to be updated with the correct index into the effects.
+        '''
+        for ind in range(0, self.effect_count):
+            eff_hdr = get_record(self.effects, ind, self.effect_size)
+            if eff_hdr == new_effect:
+                return ind
+
+        # Append new header.
+        self.effects += new_effect
+        self.effect_count += 1
+
+        return self.effect_count - 1
+
+    def get_pctech(self, tech_id: int) -> pctech.PCTech:
+        '''
+        (In-Progress) Updated version of get_tech that returns a ctt.PCTech.
+        '''
+        control_b = get_record(self.controls, tech_id, self.control_size)
+        control = ctt.PCTechControlHeader(control_b)
+
+        battle_group_index = control.battle_group_id
+        battle_group_b = get_record(self.bat_grps,
+                                    battle_group_index,
+                                    self.bat_grp_size)
+        battle_group = ctt.PCTechBattleGroup(battle_group_b)
+
+        effect_headers: list[ctt.PCTechEffectHeader] = []
+        effect_mps: list[int] = []
+        for ind in range(battle_group.number_of_pcs):
+            eff_ind = control.get_effect_index(ind)
+            effect_b = get_record(self.effects, eff_ind, self.effect_size)
+            effect = ctt.PCTechEffectHeader(effect_b)
+            effect_headers.append(effect)
+
+            eff_mp = self.mps[eff_ind]
+            effect_mps.append(eff_mp)
+
+        gfx_b = get_record(self.gfx, tech_id, self.gfx_size)
+        gfx = ctt.PCTechGfxHeader(gfx_b)
+
+        target_b = get_record(self.targets, tech_id, self.target_size)
+        target = ctt.PCTechTargetData(target_b)
+
+        name_b = get_record(self.names, tech_id, self.name_size)
+        name = ctstrings.CTNameString(name_b)
+
+        desc_ptr_b = get_record(self.desc_ptrs, tech_id, self.desc_ptr_size)
+        desc_start = int.from_bytes(desc_ptr_b, 'little')
+        desc_end = self.descs[desc_start:].index(0) + 1
+        desc_b = self.descs[desc_start: desc_end]
+        desc = ctstrings.CTString(desc_b)
+
+        first_dual_tech = 0x39
+        if self.first_trip_grp < len(self.group_sizes):
+            first_triple_tech = self.group_sizes[self.first_trip_grp]
+        else:
+            first_triple_tech = self.group_sizes[-1] + 3
+        if self.first_rock_grp < len(self.group_sizes):
+            first_rock_tech = self.group_sizes[self.first_rock_grp]
+        else:
+            first_rock_tech = self.group_sizes[-1]+3
+        num_triple_techs = len(self.menu_grps) - self.first_trip_grp
+
+        learn_req: Optional[ctt.PCTechLearnRequirements]
+        menu_mp: Optional[ctt.PCTechMenuMPReq]
+
+        if tech_id >= first_rock_tech:
+            rock_tech_num = tech_id - first_rock_tech
+            rock_offset = self.rock_types[tech_id]
+
+            rock_list: list[pctech.RockType] = [
+                ctenums.ItemID.BLACK_ROCK, ctenums.ItemID.BLUE_ROCK,
+                ctenums.ItemID.SILVERROCK, ctenums.ItemID.WHITE_ROCK,
+                ctenums.ItemID.GOLD_ROCK
+            ]
+            rock_used = rock_list[rock_offset]
+        else:
+            rock_used = None
+
+        if tech_id < first_dual_tech or tech_id >= first_rock_tech:
+            learn_req = None
+        else:
+            learn_req_b = get_record(self.lrn_reqs, tech_id-0x39,
+                                     self.lrn_req_size)
+            learn_req = ctt.PCTechLearnRequirements(learn_req_b)
+
+
+        if tech_id < first_dual_tech:
+            menu_mp = None
+        elif tech_id < first_triple_tech:
+            mmp_start = (tech_id - first_dual_tech)*2
+            menu_mp_b = self.menu_mp_reqs[mmp_start:mmp_start+2]
+            menu_mp = ctt.PCTechMenuMPReq(menu_mp_b)
+        else:
+            mmp_start = (tech_id - first_dual_tech)*2 + \
+                (tech_id - first_triple_tech)
+            menu_mp_b = self.menu_mp_reqs[mmp_start:mmp_start+3]
+            menu_mp = ctt.PCTechMenuMPReq(menu_mp_b)
+
+        atb_pen_b = self.atb_pens[tech_id: tech_id+1]
+        if tech_id >= first_triple_tech:
+            atb_pen_b.append(self.atb_pens[tech_id+num_triple_techs])
+        atb_pen = ctt.PCTechATBPenalty(atb_pen_b)
+
+        pc_target = self.pc_target[tech_id]
+        menu_usable = tech_id in self.menu_usable_ids
+
+        return pctech.PCTech(
+            battle_group, control, effect_headers, effect_mps,
+            menu_mp, gfx, target, learn_req, name, desc, atb_pen,
+            None, menu_usable, pc_target
+        )
+
+    # Gets most information about a tech.  Most notable missing info is the
+    # animation script, but it's not needed since we're just shuffling techs.
+    def get_tech(self, tech_id):
+        ret_tech = dict()
+        ret_tech['control'] = get_record(self.controls,
+                                         tech_id,
+                                         self.control_size)
+
+        ret_tech['effects'] = [[], [], []]
+        for i in range(0, 3):
+            eff_ind = (ret_tech['control'][5+i] & 0x7F)
+            eff = get_record(self.effects, eff_ind, self.effect_size)
+            # print_bytes(eff,12)
+            ret_tech['effects'][i] = eff[:]
+
+        ret_tech['gfx'] = get_record(self.gfx, tech_id, self.gfx_size)
+
+        ret_tech['target'] = get_record(self.targets,
+                                        tech_id,
+                                        self.target_size)
+
+        ret_tech['pc_target'] = self.pc_target[tech_id]
+
+        ret_tech['name'] = get_record(self.names, tech_id, self.name_size)
+
+        bat_id = ret_tech['control'][0] & 0x7F
+        ret_tech['bat_grp'] = get_record(self.bat_grps,
+                                         bat_id,
+                                         self.bat_grp_size)
+
+        desc_ptr = get_record(self.desc_ptrs, tech_id,
+                              self.desc_ptr_size)
+
+        ret_tech['desc_ptr'] = desc_ptr[:]
+
+        start = get_value_from_bytes(desc_ptr)
+        start = start - (self.desc_start % 0x010000)
+
+        end = start
+        while self.descs[end] != 0x00:
+            end += 1
+
+        ret_tech['desc'] = self.descs[start:end]
+
+        # Getting the thresholds for dual/triple/rock techs is a little dicey
+        # when there are none.  This all needs to be reconsidered.
+        if self.first_dual_grp < len(self.group_sizes):
+            first_dual_tech = self.group_sizes[self.first_dual_grp]
+        else:
+            first_dual_tech = self.group_sizes[-1]+8
+
+        if self.first_trip_grp < len(self.group_sizes):
+            first_trip_tech = self.group_sizes[self.first_trip_grp]
+        else:
+            first_trip_tech = self.group_sizes[-1]+3
+
+        if self.first_rock_grp < len(self.group_sizes):
+            first_rock_tech = self.group_sizes[self.first_rock_grp]
+        else:
+            first_rock_tech = self.group_sizes[-1]+3
+
+        if tech_id < first_dual_tech:
+            ret_tech['lrn_req'] = None
+        elif tech_id >= first_rock_tech:
+            ret_tech['lrn_req'] = None
+        else:
+            ret_tech['lrn_req'] = get_record(self.lrn_reqs,
+                                             tech_id-0x39,
+                                             self.lrn_req_size)
+
+        if tech_id < first_dual_tech:
+            ret_tech['mmp'] = None
+        elif tech_id < first_trip_tech:
+            mmp_start = (tech_id-0x39)*2
+            ret_tech['mmp'] = self.menu_mp_reqs[mmp_start:mmp_start+2]
+        else:
+            mmp_start = (tech_id-0x39)*2 + (tech_id-first_trip_tech)
+            ret_tech['mmp'] = self.menu_mp_reqs[mmp_start:mmp_start+3]
+
+        ret_tech['atb_pen'] = [self.atb_pens[tech_id]]
+        num_trips = len(self.menu_grps)-self.first_trip_grp
+
+        if tech_id >= first_trip_tech:
+            ret_tech['atb_pen'].append(self.atb_pens[tech_id+num_trips])
+
+        return ret_tech
+    # End get_tech
+
+    # Update desc ptrs to point into the right place
+    def set_desc_start(self, new_start):
+        offset = (new_start % 0x010000) - (self.desc_start % 0x010000)
+
+        for i in range(self.desc_ptr_count):
+            ptr = get_record(self.desc_ptrs, i, self.desc_ptr_size)
+            ptr_addr = get_value_from_bytes(ptr)
+            ptr_addr = ptr_addr + offset
+            new_ptr = to_little_endian(ptr_addr, 2)
+            set_record(self.desc_ptrs, new_ptr, i, self.desc_ptr_size)
+
+        self.desc_start = new_start
+
+    # Companion to get_tech.  Puts a tech into the db.  Again, we assume that
+    # the animation script is in the rom already and we just pass the right
+    # index to it in the gfx data.
+    def set_tech(self, tech, tid):
+
+        set_record(self.gfx, tech['gfx'], tid, TechDB.gfx_size)
+        set_record(self.targets, tech['target'], tid, TechDB.target_size)
+
+        self.pc_target[tid] = tech['pc_target']
+
+        set_record(self.names, tech['name'], tid, TechDB.name_size)
+
+        # Look for battle group
+        found = False
+        ind = 0
+
+        if self.first_rock_grp == len(self.menu_grps):
+            is_rock = False
+        else:
+            is_rock = (tid >= self.group_sizes[self.first_rock_grp])
+
+        for i in range(self.bat_grp_count):
+            grp = get_record(self.bat_grps, i, self.bat_grp_size)
+            if grp == tech['bat_grp']:
+                found = True
+                ind = i
+                break
+
+        if not found:
+            ind = self.add_bat_grp(tech['bat_grp'], is_rock)
+
+        ctl_x80 = tech['control'][0] & 0x80
+        tech['control'][0] = ind | ctl_x80
+
+        set_record(self.controls, tech['control'], tid, TechDB.control_size)
+
+        grp_count = 0
+        for pc_ind in tech['bat_grp']:
+            if pc_ind != 0xFF:
+                grp_count += 1
+
+        if grp_count > 1 and not is_rock:
+            set_record(self.lrn_reqs, tech['lrn_req'], tid-0x39,
+                       TechDB.lrn_req_size)
+
+        self.atb_pens[tid] = tech['atb_pen'][0]
+
+        # desc_ptr/desc
+        if tech['desc_ptr'] is not None:
+            # If desc_ptr is set, assume the user knows what they're doing.
+            # Usually when shuffling things around, we can just pass ptrs
+            set_record(self.desc_ptrs, tech['desc_ptr'], tid,
+                       TechDB.desc_ptr_size)
+        else:
+            # If desc_ptr is not set, just add the desc to the end and set the
+            # pointer to the new text.
+
+            new_ptr = (self.desc_start+len(self.descs)) % 0x10000
+            new_ptr_b = to_little_endian(new_ptr, 2)
+
+            set_record(self.desc_ptrs, new_ptr_b, tid,
+                       TechDB.desc_ptr_size)
+
+            self.descs.extend(tech['desc'])
+
+        # mmp set
+        if grp_count == 2:
+            if tid < 0x39:  # Duals always start at 0x39
+                raise ValueError(
+                    f"TechID {tid:02X} is single tech, but battle group has"
+                    "two PCs"
+                )
+
+            mmp_start = (tid-0x39)*2
+            self.menu_mp_reqs[mmp_start:mmp_start+2] = tech['mmp'][0:2]
+        elif grp_count == 3:
+            first_trip = self.group_sizes[self.first_trip_grp]
+            if tid < first_trip:
+                raise ValueError(
+                    f"TechID {tid:02X} is dual tech, but battle group has"
+                    "three PCs"
+                )
+
+            mmp_start = (tid-0x39)*2+(tid-first_trip)
+            self.menu_mp_reqs[mmp_start:mmp_start+3] = tech['mmp'][0:3]
+
+        if grp_count == 3:
+            num_trips = \
+                len(self.menu_grps) - self.group_sizes[self.first_trip_grp]
+
+            self.atb_pens[tid+num_trips] = tech['atb_pen'][1]
+        # leave mp alone for now
+
+    def _set_menu_grps(self, menu_grps: bytes, num_rocks: int):
+        '''
+        Sets the TechDB to have the given meny groups.
+
+        Sets the tech type thresholds (first dual, first triple, etc) as well.
+        The number of rock groups must be provided since that cannot be
+        determined just from the groups.
+
+        This should only be used during DB construction so it is marked as
+        protected.
+        '''
+        self.menu_grps = bytearray(menu_grps)
+        self.menu_grp_count = len(menu_grps)
+
+        # Now check for first dual, trip, etc.
+        cur_grp_size = 1
+
+        for ind, cur_grp in enumerate(menu_grps):
+            masks = (1 << shift for shift in range(8))
+            count = sum(bool(cur_grp & mask) for mask in masks)
+
+            if count == 0:
+                raise ValueError("Empty Group.")
+            if cur_grp_size == 1:
+                if count == 2:
+                    cur_grp_size = 2
+                    self.first_dual_grp = ind
+                elif count == 3:
+                    raise ValueError("Skipped from single to triple")
+            elif cur_grp_size == 2:
+                if count == 3:
+                    cur_grp_size = 3
+                    self.first_trip_grp = ind
+                elif count == 1:
+                    raise ValueError("Went from dual back to single")
+            elif cur_grp_size == 3:
+                if count == 2:
+                    raise ValueError("Went from triple back to dual")
+                if count == 1:
+                    raise ValueError("Went from triple back to single.")
+
+        self.first_rock_grp = len(menu_grps) - num_rocks
+
+        self.group_used = bytearray([0]*len(menu_grps))
+        for i in range(0, self.first_dual_grp):
+            self.group_used[i] = 8
+
+        for i in range(self.first_dual_grp, self.first_trip_grp):
+            self.group_used[i] = 3
+
+        for i in range(self.first_trip_grp, len(menu_grps)):
+            self.group_used[i] = 1
+    # Ending set_menu_grps
+
+    def get_menu_grp_ind(self, menu_grp: int) -> Optional[int]:
+        '''Returns the index of the given group of it exists else None.'''
+        if menu_grp in self.menu_grps:
+            return self.menu_grps.index(menu_grp)
+
+        return None
+
+    # Update all pointers in lrn_refs based on the current start and the
+    # new start.
+    # Only the low order 2 bytes are used from new_start.
+    def set_lrn_req_start(self, new_start):
+        '''
+        Update all pointers in lrn_refs based on the current and new start.
+
+
+        '''
+        start = new_start % 0x010000
+        offset = start - (self.lrn_req_start % 0x010000)
+
+        # print_bytes(self.lrn_refs, 5)
+        for i in range(self.lrn_ref_count):
+            ptr_start = i*self.lrn_ref_size+3
+            ptr = self.lrn_refs[ptr_start:ptr_start+2]
+            ptr_val = get_value_from_bytes(ptr)
+            ptr_val = ptr_val + offset
+
+            self.lrn_refs[ptr_start:ptr_start+2] = to_little_endian(ptr_val, 2)
+
+        # print_bytes(self.lrn_refs, 5)
+        self.lrn_req_start = new_start
+
+    # End set_lrn_req_start
+
+    def add_bat_grp(self, bat_grp, is_rock=False):
+        # First check whether the menu group is already recorded
+        menu_grp = 0x0
+        for x in bat_grp:
+            if x != 0xFF:
+                menu_grp = menu_grp | (0x80 >> x)
+
+        # print("Menu grp: %2.2X" % menu_grp)
+        ind = self.add_menu_grp(menu_grp, is_rock)
+
+        # Now see if the battle group is already there
+        ind_grp = get_record(self.bat_grps, ind, self.bat_grp_size)
+
+        if ind_grp == bat_grp:
+            return ind
+        elif ind_grp == bytearray([0, 0, 0]):
+            # print("Found empty group in expected position. Filling.")
+            split = self.bat_grp_size*ind
+            self.bat_grps[split:split+3] = bat_grp
+            return ind
+        else:
+            # Need to look for the rest
+            found = False
+            for i in range(ind, self.bat_grp_count):
+                i_grp = get_record(self.bat_grps, i, self.bat_grp_size)
+                # The order really matters, so it's a list comparison
+                if(i_grp == bat_grp):
+                    # print("Group found at %d" % i)
+                    ind = i
+                    found = True
+                    break
+            if not found:
+                # Just add onto the end
+                # print('Adding to end in position %2.2X' % self.bat_grp_count)
+                ind = self.bat_grp_count
+                self.bat_grps.extend(bat_grp)
+                self.bat_grp_count += 1
+            # This is either set when found in the loop or set above when not
+            # found.
+            return ind
+        # Ending the else for needing to search the list
+    # Ending add_bat_grp
+
+    # Adds new bitmask menu group to the tech db
+    # Returns an index to the newly added group.  Will also return the index
+    # of the group if it already exists.
+    def add_menu_grp(self, menu_grp, is_rock=False):
+        # Only duals/trips/rocks for now. No single
+
+        temp = menu_grp
+        num_pcs = 0
+        for i in range(0, 8):
+            if temp & 0x01 != 0:
+                num_pcs += 1
+
+            temp = temp >> 1
+
+        start_grp = 0
+        end_grp = 0
+
+        if num_pcs == 1 or num_pcs > 3:
+            print('Error: Group %2.2X has size == %d' % (menu_grp, num_pcs))
+            start_grp = None
+            end_grp = None
+        elif num_pcs == 2:
+            num_to_add = 3
+            start_grp = self.first_dual_grp
+            end_grp = self.first_trip_grp
+        else:
+            num_to_add = 1
+            if is_rock:
+                # print('Is rock.')
+                start_grp = self.first_rock_grp
+                end_grp = self.menu_grp_count
+            else:
+                # print('Is not rock.')
+                start_grp = self.first_trip_grp
+                end_grp = self.first_rock_grp
+
+        ins_ind = start_grp
+        found = False
+        for i in range(start_grp, end_grp):
+            if self.menu_grps[i] == menu_grp:
+                found = True
+                # print("Menu group already found at index %d." % i)
+                return i
+
+        if not found:
+            print("Menu group not already found.  Making room.")
+
+            ins_ind = end_grp
+            self.menu_grps.insert(ins_ind, menu_grp)
+            # Then we need to make some new space in many places
+
+            if ins_ind == len(self.menu_grps):
+                ins_size = self.group_sizes[ins_ind-1]+1
+            else:
+                ins_size = self.group_sizes[ins_ind]
+
+            # shift all sizes up by the right amount
+            # insert with index of old first_trip
+            for i in range(end_grp, len(self.group_sizes)):
+                self.group_sizes[i] += num_to_add
+
+            self.group_sizes.insert(ins_ind, ins_size)
+            self.group_used.insert(ins_ind, 0)
+            if num_pcs == 2:
+                self.first_trip_grp += 1
+            self.first_rock_grp += 1
+
+            tech_id_start = self.group_sizes[ins_ind]
+
+            # Inserting a new battle group means that all control headers need
+            # to have their battle group checked and updated.
+            for i in range(0, self.control_count):
+                start = i*self.control_size
+                bat_grp_x80 = self.controls[start] & 0x80
+                bat_grp_ind = self.controls[start] & 0x7F
+
+                if bat_grp_ind >= ins_ind:
+                    bat_grp_ind += 1
+                    self.controls[start] = bat_grp_ind | bat_grp_x80
+
+            lrn_refs_to_add = 0
+            lrn_reqs_to_add = 0
+            if not is_rock:
+                lrn_refs_to_add = 1
+                lrn_reqs_to_add = num_to_add
+
+            dat = [self.controls, self.gfx, self.names, self.desc_ptrs,
+                   self.targets, self.techs_learned, self.lrn_refs,
+                   self.menu_mp_reqs, self.bat_grps, self.lrn_reqs]
+
+            self.control_count += num_to_add
+            self.gfx_count += num_to_add
+            self.name_count += num_to_add
+            self.desc_ptr_count += num_to_add
+            self.target_count += num_to_add
+            self.lrn_ref_count += lrn_refs_to_add
+            self.bat_grp_count += 1
+            self.lrn_req_count += lrn_reqs_to_add
+
+            # menu_mp insert spot is a bit harder because it comes in two byte
+            # chunks until triples and then 3 byte chunks
+            if num_pcs == 3:
+                num_trips_before = (tech_id_start
+                                    - self.group_sizes[self.first_trip_grp])
+            else:
+                num_trips_before = 0
+
+            menu_mp_split = ((tech_id_start - 0x38)*2
+                             + num_trips_before)
+
+            splits = [tech_id_start*self.control_size,        # control
+                      tech_id_start*self.gfx_size,            # gfx
+                      tech_id_start*self.name_size,           # names
+                      tech_id_start*self.desc_ptr_size,       # desc_ptrs
+                      tech_id_start*self.target_size,         # targets
+                      ins_ind*1,                              # techs_learned
+                      (ins_ind-7)*self.lrn_ref_size,          # lrn_refs
+                      menu_mp_split,                          # menu_mp_reqs
+                      ins_ind*self.bat_grp_size,              # bat_grps
+                      (tech_id_start-0x38)*3]                 # lrn_req
+
+            sizes = [self.control_size*num_to_add,            # control
+                     self.gfx_size*num_to_add,                # gfx
+                     self.name_size*num_to_add,               # names
+                     self.desc_ptr_size*num_to_add,           # desc_ptrs
+                     self.target_size*num_to_add,             # targets
+                     1,                                       # techs_learned
+                     5*lrn_refs_to_add,                       # lrn_refs
+                     num_to_add*num_pcs,                      # menu_mp_reqs
+                     3,                                       # bat_grps
+                     3*lrn_reqs_to_add]                       # lrn_req
+
+            for i in range(0, len(sizes)):
+                dat[i][splits[i]:splits[i]] = bytearray([0]*sizes[i])
+
+            if not is_rock:
+                # Now fix the pointers in lrn_refs.  All of the ones after the
+                # insertion are off.
+
+                start = (ins_ind-7)*self.lrn_ref_size
+                after = start + self.lrn_ref_size
+                self.lrn_refs[start+3:start+5] = self.lrn_refs[after+3:after+5]
+
+                self.lrn_refs[start] = menu_grp
+                self.lrn_refs[start+1] = self.lrn_refs[after+1]
+                self.lrn_refs[start+2] = num_to_add
+
+                for i in range(ins_ind-6, self.lrn_ref_count):
+                    start = i*self.lrn_ref_size
+                    ptr = self.lrn_refs[start+3:start+5]
+                    new_addr = get_value_from_bytes(ptr)+9
+                    self.lrn_refs[start+3:start+5] = \
+                        to_little_endian(new_addr, 2)
+                    self.lrn_refs[start+1] += 3
+        else:
+            pass
+            # print("Already found menu group.  No expansion to do.")
+
+        # When not already found, ins_ind (usually self.first_trip) is returned
+        return ins_ind
+    # End add_menu_grp
+
+    @staticmethod
+    def write_default_db(db, rom):
+        TechDB.write_db(db, rom,
+                        0x0C1BEB,
+                        0x0C213F,
+                        0x0D45A6,
+                        0x0C1ACB,
+                        0x0C2963,
+                        0x0C249F,
+                        0x0C15C4,
+                        0x0C3B0D,
+                        0x0C3A09,
+                        0x0C0230,
+                        0x0C27F7,
+                        0x0C2778,
+                        0x0C253B,
+                        0x0C28DB,
+                        0x02BD40,
+                        0x0C2BDC)
+
+    # This method writes 0xFF to the rom in the places the db is recording.
+    # This is used for two main reasons.  First, we want to make sure that old
+    # data is not read when we relocate.  Writing the FFs should make things
+    # error out.  Second, we test that a db is faithfully recording by
+    # FFing and then writing the real data back over.
+    @staticmethod
+    def write_db_ff(db, rom,
+                    control_start,
+                    effect_start,
+                    gfx_start,
+                    targets_start,
+                    menu_grps_start,
+                    bat_grps_start,
+                    names_start,
+                    desc_start,
+                    desc_ptr_start,
+                    techs_learned_start,
+                    lrn_req_start,
+                    lrn_refs_start,
+                    mp_start,
+                    menu_mp_reqs_start,
+                    group_sizes_start,
+                    atb_pen_start):
+
+        starts = [control_start, effect_start, gfx_start, targets_start,
+                  menu_grps_start, bat_grps_start, names_start,
+                  desc_start, desc_ptr_start,
+                  lrn_req_start, lrn_refs_start, mp_start,
+                  menu_mp_reqs_start, group_sizes_start,
+                  atb_pen_start]
+
+        db_dat = [db.controls, db.effects, db.gfx, db.targets,
+                  db.menu_grps, db.bat_grps, db.names,
+                  db.descs, db.desc_ptrs,
+                  db.lrn_reqs, db.lrn_refs, db.mps,
+                  db.menu_mp_reqs, db.group_sizes,
+                  db.atb_pens]
+
+        for i in range(len(starts)):
+            length = len(db_dat[i])
+            rom[starts[i]:starts[i]+length] = bytearray([0xFF]*length)
+
+    @staticmethod
+    def write_db_ff_internal(db, rom):
+        TechDB.write_db_ff(db, rom,
+                           db.control_start,
+                           db.effect_start,
+                           db.gfx_start,
+                           db.target_start,
+                           db.menu_grp_start,
+                           db.bat_grp_start,
+                           db.name_start,
+                           db.desc_start,
+                           db.desc_ptr_start,
+                           db.techs_learned_start,
+                           db.lrn_req_start,
+                           db.lrn_ref_start,
+                           db.mp_start,
+                           db.menu_req_start,
+                           db.group_sizes_start,
+                           db.atb_pen_start)
+
+    @staticmethod
+    def mark_techdb(db, fs: freespace.FreeSpace,
+                    mark_type: freespace.FSWriteType):
+
+        starts = [db.control_start, db.effect_start, db.gfx_start,
+                  db.target_start, db.menu_grp_start, db.bat_grp_start,
+                  db.name_start, db.desc_start, db.desc_ptr_start,
+                  db.lrn_req_start, db.lrn_ref_start, db.mp_start,
+                  db.menu_req_start, db.group_sizes_start,
+                  db.atb_pen_start]
+
+        sizes = [len(db.controls), len(db.effects), len(db.gfx),
+                 len(db.targets), len(db.menu_grps), len(db.bat_grps),
+                 len(db.names), len(db.descs), len(db.desc_ptrs),
+                 len(db.lrn_reqs), len(db.lrn_refs), len(db.mps),
+                 len(db.menu_mp_reqs), len(db.group_sizes),
+                 len(db.atb_pens)]
+
+        for i in range(len(starts)):
+            fs.mark_block((starts[i], starts[i]+sizes[i]),
+                          mark_type)
+
+    @staticmethod
+    def write_db(db, rom,
+                 control_start,
+                 effect_start,
+                 gfx_start,
+                 target_start,
+                 menu_grp_start,
+                 bat_grp_start,
+                 name_start,
+                 desc_start,
+                 desc_ptr_start,
+                 techs_learned_start,
+                 lrn_req_start,
+                 lrn_ref_start,
+                 mp_start,
+                 menu_mp_req_start,
+                 group_sizes_start,
+                 atb_pen_start):
+
+        # First fix all of the references.  This is important to do first
+        # because techs_learned has a block copied potentially to a new bank.
+
+        num_trips = len(db.menu_grps) - db.first_trip_grp
+
+        fix_tech_refs(rom,
+                      control_start,
+                      effect_start,
+                      gfx_start,
+                      target_start,
+                      bat_grp_start,
+                      menu_grp_start,
+                      name_start,
+                      desc_ptr_start,
+                      desc_start,
+                      db.orig_techs_learned_start, techs_learned_start,
+                      lrn_req_start,
+                      lrn_ref_start,
+                      mp_start,
+                      menu_mp_req_start,
+                      group_sizes_start,
+                      atb_pen_start, num_trips)
+
+        # $FF/F863 A2 24       LDX #$24
+        # This is a hardcoded number of menu groups.  The value should be an
+        # index to the last menu group.
+        rom[0x3ff864] = len(db.menu_grps)-1
+
+        # $FF/F910 C9 0F       CMP #$0F
+        # Looks like a count of the dual groups.  Needs to be altered.
+        rom[0x3FF911] = db.first_trip_grp - db.first_dual_grp
+
+        # $FF/F936 C9 0F       CMP #$0F
+        # This is the same but for triple techs.  It's hard but not impossible
+        # to get more than 15 triples, so fix it!
+        rom[0x3FF937] = len(db.menu_grps) - db.first_trip_grp
+
+        # These two need more care since the relative location of trip/rock
+        # will vary depending on the reassignment
+        # $FF/F97A BF 83 29 CC LDA $CC2983,x  --> 0x3FF97B  (Rock Techs)
+        # $FF/F91A BF 79 29 CC LDA $CC2979,x  --> 0x3FF91B  (Triple Techs)
+
+        trip_grp_start = menu_grp_start + db.first_trip_grp
+        trip_grp_start = to_rom_ptr(trip_grp_start)
+        trip_grp_start_b = to_little_endian(trip_grp_start, 3)
+
+        rom[0x3FF91B:0x3FF91B+3] = trip_grp_start_b[:]
+
+        # this might be hit by charrando.update_rock_techs
+        rock_grp_start = menu_grp_start + db.first_rock_grp
+        rock_grp_start = to_rom_ptr(rock_grp_start)
+        rock_grp_start_b = to_little_endian(rock_grp_start, 3)
+
+        rom[0x3FF97B:0x3FF97B+3] = rock_grp_start_b[:]
+
+        # Menu Req references that depend on number of techs
+        num_dual_techs = 3*(db.first_trip_grp-7)
+        trip_menu_mp_start = menu_mp_req_start + 2*num_dual_techs
+        trip_menu_mp_start_b = to_little_endian(trip_menu_mp_start, 3)
+
+        # Menu MP start of trips
+        # $FF/F947 BF 35 29 CC LDA $CC2935,x --> 0x3FF948
+        rom[0x3FF948:0x3FF948+3] = trip_menu_mp_start_b
+
+        # $FF/F98C BF 53 29 CC LDA $CC2953,x
+        # $CC2953 is the start of the rock part of the menu_mp_req
+        num_non_rock_trips = db.first_rock_grp-db.first_trip_grp
+
+        if db.first_rock_grp >= len(db.menu_grps):
+            mmp_offset = 0
+        else:
+            mmp_offset = \
+                2*(db.group_sizes[db.first_rock_grp]-0x39)\
+                + num_non_rock_trips
+
+        rock_mmp_start = menu_mp_req_start + mmp_offset
+        rom[0x3FF98D:0x3FF98D+3] = to_little_endian(rock_mmp_start, 3)
+
+        # There's a very weird bug where if there are too many techs the menu
+        # reqs will write over graphics pointers in memory.  We are going to
+        # expand the list and shift it backwards.
+
+        # Set the start of the menu reqs 7*0x40 back.  Somehow this is all free
+        # at the time we need it to be.
+
+        # $FF/F8C1 A9 40 16    LDA #$1640
+        rom[0x3FF8C2:0x3FF8C2+2] = to_little_endian(0x1480, 2)
+
+        # Originally pc-id was obtained as 0xID00 and then LSR'd twice to
+        # get an index into the 0x40 byte range for each PC.  We're doubling it
+        # so remove one LSR.
+        # $FF/F8E9 4A          LSR A
+        rom[0x3FF8E9] = 0xEA   # NOP
+
+        # $FF/F8DE 4A          LSR A
+        rom[0x3FF8DE] = 0xEA
+
+        # $FF/F941 4A          LSR A
+        rom[0x3FF941] = 0xEA
+
+        # Now when reading.
+        # $C2/BC3A 4A          LSR A
+        rom[0x02BC3A] = 0xEA   # NOP
+
+        # $C2/BC46 BD 07 16    LDA $1607,x[$7E:1640]   A:0000 X:0039 Y:0001
+        # Note X has an absolute tech_id in it, so we need to go 0x39 spots
+        # before the new start (0x1480)
+        rom[0x02BC47:0x02BC47+2] = to_little_endian(0x1480-0x39, 2)
+
+        # Loading menu page + a value to get menu page descs
+        # $C2/BE2F 69 76       ADC #$76
+        # Should be num desc ptrs - 3
+        rom[0x02BE30] = db.desc_ptr_count - 3
+
+        db.orig_techs_learned_start = techs_learned_start
+
+        # When the characters have no duals and/or no triples some of the menus
+        # get weird because they look at the start of the next group for loop
+        # upper bounds.
+
+        # So when there are no duals/trips put a dummy last entry in.
+        # A write method shouldn't change the underlying db, so put the data
+        # in a temp list
+        first_trip_id = 0
+
+        group_sizes_write = db.group_sizes[:]
+
+        if db.first_dual_grp == len(db.group_sizes):
+            # There are no duals and so no trips
+            group_sizes_write.append(db.group_sizes[-1]+8)
+            first_trip_id = 0x38
+        elif db.first_trip_grp == len(db.group_sizes):
+            # There are duals but no trips
+            first_trip_id = db.group_sizes[db.first_trip_grp-1]+3
+            group_sizes_write.append(db.group_sizes[-1]+3)
+        else:
+            first_trip_id = db.group_sizes[db.first_trip_grp]
+
+        old_lrn_req_start = db.lrn_req_start
+        old_desc_start = db.desc_start
+
+        # rewrite pointers (temporarily) for the write
+        db.set_lrn_req_start(lrn_req_start)
+        db.set_desc_start(desc_start)
+
+        # This doesn't need to be a member of TechDB because we always just
+        # write 0s to the spots.
+        db.techs_learned = bytearray(
+            [0 for i in db.menu_grps]
+        )
+        db.techs_learned.append(0xFF)
+
+        starts = [control_start, effect_start, gfx_start, target_start,
+                  menu_grp_start, bat_grp_start, name_start,
+                  desc_start, desc_ptr_start, techs_learned_start+14,
+                  lrn_req_start, lrn_ref_start, mp_start,
+                  menu_mp_req_start, group_sizes_start,
+                  atb_pen_start]
+
+        db_dat = [db.controls, db.effects, db.gfx, db.targets,
+                  db.menu_grps, db.bat_grps, db.names,
+                  db.descs, db.desc_ptrs, db.techs_learned[7:],
+                  db.lrn_reqs, db.lrn_refs, db.mps,
+                  db.menu_mp_reqs, group_sizes_write,
+                  db.atb_pens]
+
+        for i in range(len(starts)):
+            length = len(db_dat[i])
+            rom[starts[i]:starts[i]+length] = db_dat[i][:]
+
+        # You must FF-terminate the learn refs or searches in it may overflow
+        rom[lrn_ref_start+db.lrn_ref_count*TechDB.lrn_ref_size] = 0xFF
+
+        # Ditto with techs_learned (I think?)  but it's also nice to just see
+        # where it ends when inspecting ram
+        rom[techs_learned_start+14+len(db.techs_learned)] = 0xFF
+
+        # The six bytes starting at 0x02BD65 give the group ranges for single,
+        # dual, and triple techs.  We need to update them according to the db.
+        # The format is sing start, #sing, dual_start, #dual, trip start, #trip
+
+        rom[0x02BD68] = db.first_trip_grp-db.first_dual_grp
+        rom[0x02BD69] = db.first_trip_grp
+
+        # Weird menu bug if this is 0.  Make it 1, and it will just fail
+        # to find a triple and quit.
+        rom[0x02BD6A] = max(len(db.menu_grps)-db.first_trip_grp, 1)
+
+        # Ranges for battle menu to pick up techs
+        # The battle menu will always be broken when there are too many techs.
+
+        # $C1/CA37 A9 66       LDA #$66 <--- loading first triple tech id
+
+        rom[0x01CA38] = first_trip_id
+
+        # $C1/CCE5 A9 66       LDA #$66   <--- first triple tech id
+        # $C1/CCE7 85 08       STA $08
+        # $C1/CCE9 A9 75       LDA #$75   <--- last triple tech id+1
+        # $C1/CCEB 85 0E       STA $0E
+
+        rom[0x01CCE6] = first_trip_id
+        rom[0x01CCEA] = db.group_sizes[-1]+1
+
+        # $C1/CD08 BD 4D 28    LDA $284D,x[$7E:285C]
+        # $C1/CDEE BD 4D 28    LDA $284D,x[$7E:285C]
+
+        # These are loading the techs-learned from ram.
+        # When we change the number of dual groups, this has to change.
+        orig_start = 0x2830 + 7
+        trip_start = orig_start + db.first_trip_grp
+
+        trip_start_addr = to_little_endian(trip_start, 2)
+
+        rom[0x01CD09:0x01CD09+2] = trip_start_addr
+        rom[0x01CDEF:0x01CDEF+2] = trip_start_addr
+
+        # print("Num Techs: ", db.control_count)
+        num_techs = db.control_count  # counting the attack bits
+
+        # hack to keep attack bits right for now
+        for i in range(0, 7):
+            rom[0x0C2583+i] = (num_techs - 7 + i)
+
+        # Alter menu usability.  This is performed by setting the x80 bit in
+        # memory corresponding to each tech.  $7E7700 + tech_id is where it
+        # looks for tech #tech_id.  Sometimes there will be too many techs,
+        # so we have to jump and extend the routine.
+        """
+        $FF/F82E A9 80       LDA #$80
+        $FF/F830 0C 09 77    TSB $7709  [$7E:7709]
+        $FF/F833 0C 0C 77    TSB $770C  [$7E:770C]
+        $FF/F836 0C 0F 77    TSB $770F  [$7E:770F]
+        $FF/F839 0C 1A 77    TSB $771A  [$7E:771A]
+        $FF/F83C 0C 1D 77    TSB $771D  [$7E:771D]
+        $FF/F83F 0C 21 77    TSB $7721  [$7E:7721]
+        $FF/F842 0C 24 77    TSB $7724  [$7E:7724]
+        $FF/F845 0C 27 77    TSB $7727  [$7E:7727]
+        $FF/F848 0C 29 77    TSB $7729  [$7E:7729]
+        """
+
+        new_ids = bytearray()
+        for i in range(0, len(db.menu_usable_ids)):
+            if db.menu_usable_ids[i]:
+                new_ids.append(i)
+
+        if len(new_ids) <= 9:
+            # We can just overwrite the old values
+            write_pos = 0x3FF831
+            for x in new_ids:
+                rom[write_pos] = x
+                write_pos += 3
+
+            # get to the end of the last TSB we edited
+            write_pos += 1
+
+            # Write NOPs until the end of the last old TSB
+            while write_pos <= 0x3FF84A:
+                rom[write_pos] = 0xEA
+                write_pos += 1
+        else:
+            # Need to jump out and write the new TSBs elsewhere
+
+            # 29 bytes starting at 0x3FF82E
+            new_rt = bytearray([0x22, 0x00, 0x74, 0x5F])  # JSL $5F7400
+            while len(new_rt) < 29:
+                new_rt.append(0xEA)  # NOP out the rest
+
+            # There is some junk in the 0x3F bank, and in the future we may
+            # write the new routine there for short jump to SR.
+            # Or maybe write over the pieces that we took out to expand techs?
+            rom[0x3FF82E:0x3FF84B] = new_rt
+
+            # the new menu rt is just a bunch of TSBs like before and then
+            # a JSL
+            new_menu_rt = bytearray([0xA9, 0x80])
+            for x in new_ids:
+                new_menu_rt.extend(bytearray([0x0C, x, 0x77]))
+
+            new_menu_rt.append(0x6B)
+            rom[0x5F7400:0x5F7400+len(new_menu_rt)] = new_menu_rt
+
+        # Keep attack bits right for now
+        for i in range(7):
+            rom[0x0C2583+i] = (num_techs - 7 + i)
+
+        # Fixing errant graphics data
+
+        # $C1/820D A9 79       LDA #$79 -- 0x79 is offset for running away gfx
+        # It should be 7th from the back.
+        rom[0x01820E] = db.gfx_count-7
+
+        # This is greendream loading
+        # $C1/B365 A9 7A       LDA #$7A
+        # $C1/B367 8D 93 AE    STA $AE93  [$7E:AE93]
+        rom[0x01B366] = db.gfx_count-6
+
+        # This is poison ticking
+        # $C1/8943 A9 7F       LDA #$7F
+        rom[0x018944] = db.gfx_count-1
+
+        # This is SeraphSong effect, also 7F?
+        # $C1/8BAF A9 7F       LDA #$7F
+        rom[0x018BB0] = db.gfx_count-1
+
+        # undo the changes to lrn_req and desc
+        db.set_lrn_req_start(old_lrn_req_start)
+        db.set_desc_start(old_desc_start)
+
+        # Fixing errant description pointers
+
+        # Fix "Can't run away" message.  Hardcoded description is in with
+        # the techs.  We need to fix the index.
+        # $C1/1097 A9 75       LDA #$75   Loading "Can't run away" index
+        # Vanilla: 0x79 descs, so it's always 4 less than the count.
+        num_descs = db.desc_ptr_count
+        rom[0x011098] = num_descs-4
+
+    # End write_db
+
+    @staticmethod
+    def write_db_internal(db, rom):
+        TechDB.write_db(db, rom,
+                        db.control_start,
+                        db.effect_start,
+                        db.gfx_start,
+                        db.target_start,
+                        db.menu_grp_start,
+                        db.bat_grp_start,
+                        db.name_start,
+                        db.desc_start,
+                        db.desc_ptr_start,
+                        db.techs_learned_start,
+                        db.lrn_req_start,
+                        db.lrn_ref_start,
+                        db.mp_start,
+                        db.menu_req_start,
+                        db.group_sizes_start,
+                        db.atb_pen_start)
+
+    @staticmethod
+    def write_db_internal_file(db, filename):
+        with open(filename, 'r+b') as outfile:
+            rom = outfile.read()
+            TechDB.write_db_internal(db, rom)
+
+            outfile.seek(0)
+            outfile.write(rom)
+
+    @staticmethod
+    def write_default_db_file(db, filename):
+        with open(filename, 'r+b') as outfile:
+            rom = outfile.read()
+            TechDB.write_default_db(db, rom)
+
+            outfile.seek(0)
+            outfile.write(rom)

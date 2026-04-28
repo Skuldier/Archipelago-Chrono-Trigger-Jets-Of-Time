@@ -1,0 +1,39 @@
+cjot-beta source snapshot bundled with the ctjot apworld
+==========================================================
+
+Purpose
+-------
+This `_beta/` tree is a pinned snapshot of the cjot-beta randomizer
+shipped inside the ctjot apworld. The apply-time procedure handler
+in `worlds/ctjot/Rom.py` runs `_beta/sourcefiles/randomizer.py` as
+a subprocess against the player's vanilla ROM; without this snapshot
+the player would have to install cjot-beta separately.
+
+Identity
+--------
+Snapshot date:        2026-04-25
+Source files:         163 total
+Aggregate SHA-256:    57b6828ba9f9f9190479f05a8880a624e990a6111b77bb04fd6922d93d238e6d
+                      (sorted .py + .ips + .Flux + .txt + .json
+                       contents in sourcefiles/, concatenated)
+
+Updating the snapshot
+---------------------
+1. Replace `sourcefiles/` with the contents of the new cjot-beta
+   release's `sourcefiles/` directory.
+2. Strip any `__pycache__` directories.
+3. Update `Snapshot date` and `Aggregate SHA-256` above (regenerate
+   the hash with a `find ... -type f | sort | xargs cat | sha256sum`
+   pipeline against the source files).
+4. Bump the apworld `__version__` in `worlds/ctjot/__init__.py`
+   to reflect that bundled randomizer behavior changed.
+
+Why a hash and not a git ref
+----------------------------
+This snapshot is a file copy, not a git submodule. A content hash
+lets us detect drift even when there's no upstream commit to point
+at (e.g. local fixes applied before bundling).
+
+License
+-------
+cjot-beta is GPL-licensed. See LICENSE in this directory.
