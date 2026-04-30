@@ -196,7 +196,21 @@ from .Rom import CTJoTProcedurePatch
 #            count (they have locked items). Reproduced with the
 #            user's YAML at: bekkler+cyrus+rocksanity, fill failed
 #            on slot Skuldier_CT (22 locations, 21 items).
-__version__ = "1.4.7"
+#   1.4.8 -- fix: fragments missing from AP item pool with bucket_list +
+#            chronosanity on. cjot-beta's bucketlist.py:208-212 places
+#            fragments at chests via write_fragments_to_config when a
+#            CollectNFragmentsObjective is selected, but our
+#            apply_selective_placement overrides those chests with AP
+#            placements -- the fragments vanish from the multiworld
+#            and the bucket objective is unreachable. Now: when
+#            bucket_list + chronosanity are both on, parse
+#            bucket_objective_hints for collect_N_fragments_M patterns
+#            and add MAX(M) Fragment items to the AP pool. Other
+#            players' chests can then deliver fragments back via the
+#            receive queue. Reproduced 2026-04-29 in a 12-player
+#            multiworld: zero fragments collected despite having
+#            fragment bucket objectives.
+__version__ = "1.4.8"
 
 ctjot_logger = logging.getLogger("Jets of Time")
 
@@ -305,6 +319,45 @@ class CTJoTWorld(World):
         # directly in the `victory` rules and no fragment items are placed.
         if bucket_fragments and not bucket_list and game_mode != "Lost worlds":
             for i in range(fragment_count):
+                items.append(self.create_item("Fragment"))
+
+        # bucket_list mode + chronosanity ON: cjot-beta places fragments at
+        # chests via bucketlist.py:write_fragments_to_config(), but with
+        # chronosanity our apply_selective_placement overrides those chests
+        # with AP-routed items. Fragments effectively vanish from the
+        # multiworld unless we ALSO add them to the AP item pool here, so
+        # AP fill distributes them across the multiworld and other players
+        # opening the chests routes them back to us via the receive queue.
+        #
+        # Without this fix, a "Collect 10 of N Fragments" bucket-list
+        # objective is unreachable (no fragments ever arrive in inventory).
+        # Reproduced 2026-04-29 in user's seed: bucket_list on, chronosanity
+        # on, fragment objectives configured, zero fragments collected.
+        #
+        # Count: take the MAX fragment-total across all hint slots. cjot-beta
+        # picks one objective per slot from the weighted distribution at
+        # generate time; we don't know in advance which slots will land on
+        # fragment objectives, so we provision for the worst case. If no
+        # slot picks a fragment objective, the extra Fragment items in the
+        # pool are harmless (they go to other players' chests as filler).
+        # Skipped entirely when chronosanity is off (cjot-beta's local
+        # placement works correctly there).
+        if (
+            bucket_list
+            and bool(self.options.chronosanity.value)
+            and game_mode != "Lost worlds"
+        ):
+            import re as _re_frag
+            hints = self.options.bucket_objective_hints.value or []
+            max_fragments = 0
+            for hint in hints:
+                for match in _re_frag.finditer(
+                    r'collect_(\d+)_fragments_(\d+)', str(hint)
+                ):
+                    total = int(match.group(2))
+                    if total > max_fragments:
+                        max_fragments = total
+            for _ in range(max_fragments):
                 items.append(self.create_item("Fragment"))
 
         # If this is a Lost Worlds seed we may need to add some character specific items
