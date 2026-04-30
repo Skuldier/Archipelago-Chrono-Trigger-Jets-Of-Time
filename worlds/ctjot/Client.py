@@ -90,6 +90,30 @@ MAX_IN_GAME_ITEM_ID = 255
 INVALID_TRACKING_LOCATIONS = [0x00, 0x1B1]
 MAX_MAP_ID = 0x1FF
 
+# --- Bucket-list rock objective inventory polling ---
+#
+# cjot-beta's bucket-list rock objective uses 0x7F003D as a counter
+# that originally got incremented by chest-id-based box-checks (see
+# objectivetypes.py:add_box_check). With chronosanity + AP routing,
+# chest contents are reassigned across the multiworld, so chest-open
+# no longer correlates with rock-collected and the box-checks fire
+# false-positives.
+#
+# v1.4.9 patch:
+#   - cjot-beta side: ObtainNRocksObjective.add_objective_check_to_ctrom
+#     replaced with a polling watchdog at End of Time obj 0 that fires
+#     obj-complete when 0x7F003D >= num_rocks_needed.
+#   - Client side (this code): each tick, count rock items in the
+#     player's inventory and write the count to 0x7F003D. The watchdog
+#     fires exactly when the player has actually collected the target
+#     count, regardless of whether each rock came from a vanilla
+#     chest, a local AP placement, or a cross-slot AP delivery via the
+#     receive queue.
+ROCK_BUCKET_COUNTER_ADDR = 0x7F003D
+INVENTORY_IDS_ADDR = 0x7E2400
+INVENTORY_NUM_SLOTS = 242
+ROCK_ITEM_IDS = frozenset({0xAE, 0xAF, 0xB0, 0xB1, 0xB2})
+
 
 # These are the event flag locations for the baseline (non chronosanity) checks
 _locations_baseline_key_items = {
@@ -863,6 +887,41 @@ class CTJoTSNIClient(SNIClient):
         # Don't try to deliver items if something went wrong with tracking.
         if tracking_succeeded:
             await self._deliver_next_item(ctx, ctx.items_received)
+            # Maintain the bucket-list rock-objective counter at the
+            # actual inventory rock count. cjot-beta's End of Time
+            # watchdog (objectivetypes.py v1.4.9 patch) fires when this
+            # counter reaches the objective's target.
+            await self._update_rock_objective_counter(ctx)
+
+    async def _update_rock_objective_counter(self, ctx) -> None:
+        """Count rocks in inventory and write the count to 0x7F003D.
+
+        Only relevant when bucket_list and rocksanity are both on, but
+        we keep the write unconditional: 0x7F003D is harmless to write
+        when no objective references it. Skipping the inventory read
+        when slot_data tells us neither feature is on saves a SNI
+        round-trip per tick, though.
+        """
+        # Skip if rocksanity off (no rocks in pool to collect)
+        # or slot_data hasn't arrived yet (default-safe fallback).
+        if not self.rocksanity:
+            return
+
+        from SNIClient import snes_read, snes_buffered_write, snes_flush_writes
+        inventory = await snes_read(
+            ctx,
+            self._convert_to_sni_addressing(INVENTORY_IDS_ADDR),
+            INVENTORY_NUM_SLOTS,
+        )
+        if inventory is None:
+            return
+        rock_count = sum(1 for byte in inventory if byte in ROCK_ITEM_IDS)
+        snes_buffered_write(
+            ctx,
+            self._convert_to_sni_addressing(ROCK_BUCKET_COUNTER_ADDR),
+            bytes([min(rock_count, 255)]),
+        )
+        await snes_flush_writes(ctx)
 
     async def deathlink_kill_player(self, ctx) -> None:
         """

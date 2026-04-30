@@ -912,27 +912,76 @@ class ObtainNRocksObjective(Objective):
             bucket_settings: rset.BucketSettings,
             objective_count_addr: int
             ):
-        """Add listeners to the treasures which hold rocks."""
+        """Install a rock-count polling watchdog at End of Time.
 
-        for tid, treasure in self.rock_dict.items():
-            if isinstance(treasure, treasuretypes.ScriptTreasure):
-                add_script_treasure_count(
-                    ct_rom, treasure, self,
-                    self.num_rocks_addr, self.num_rocks_needed,
-                    bucket_settings, objective_count_addr
-                )
-            elif isinstance(treasure, treasuretypes.ChestTreasure):
-                # I've checked chest-having locations for enough objects.
-                # If more box checks are added for other objectives, we may
-                # need to aggregate box check objects.
-                chest_id = treasure.chest_index
-                loc_id = treasuretypes.get_chest_loc_id(chest_id)
-                script = ct_rom.script_manager.get_script(loc_id)
-                add_box_check(script, chest_id, self,
-                              self.num_rocks_addr, self.num_rocks_needed,
-                              bucket_settings, objective_count_addr)
-            else:
-                raise TypeError(f"Unsupported Treasure Type: {type(treasure).__name__}")
+        AP-INTEGRATION PATCH (v1.4.9): the original implementation
+        installed chest-id-based box-checks at each rock-bearing chest.
+        That worked in standalone cjot-beta because chest-open implied
+        rock-collected. Under chronosanity + AP item routing, chest
+        contents are reassigned across the multiworld, so chest-open
+        no longer correlates with rock collection -- the box-checks
+        fired false-positives whenever an AP-routed non-rock item came
+        out of a chest cjot-beta originally placed a rock at.
+
+        Replacement: an event-script object at End of Time obj 0
+        polls num_rocks_addr (0x7F003D) for >= num_rocks_needed and
+        fires the obj-complete chain when the threshold is reached.
+        The SNI Client (worlds/ctjot/Client.py) maintains the counter
+        as the actual inventory rock count each tick. This makes the
+        objective fire exactly when the player has actually collected
+        the target number of rocks, regardless of whether each rock
+        came from a vanilla pickup, a local AP placement, or a
+        cross-slot AP delivery via the receive queue.
+
+        A one-shot flag at num_rocks_addr+1 (0x7F003E) prevents the
+        obj-complete chain from re-firing if the player re-enters
+        End of Time after the objective has already been completed.
+        """
+        eot_script = ct_rom.script_manager.get_script(
+            ctenums.LocID.END_OF_TIME)
+        fired_flag_addr = self.num_rocks_addr + 1  # 0x7F003E
+
+        func = (
+            EF()
+            # Function 0 (startup): early-return so the object init
+            # doesn't pause the engine.
+            .add(EC.return_cmd())
+            # If the obj-complete chain has already fired in a prior
+            # visit, skip the loop entirely.
+            .add_if(
+                EC.if_mem_op_value(fired_flag_addr, OP.NOT_EQUALS,
+                                   0, 1, 0),
+                EF().add(EC.end_cmd())
+            )
+            # Watchdog loop.
+            .set_label('loop')
+            .add_if(
+                # Real rock count >= target? Fire obj-complete.
+                EC.if_mem_op_value(self.num_rocks_addr,
+                                   OP.GREATER_OR_EQUAL,
+                                   self.num_rocks_needed, 1, 0),
+                EF()
+                # Set the one-shot so the watchdog won't re-fire on
+                # subsequent visits.
+                .add(EC.assign_val_to_mem(1, fired_flag_addr, 1))
+                .add(EC.set_explore_mode(False))
+                # add_obj_complete inserts the obj-complete chain here.
+                .set_label('obj')
+                .add(EC.set_explore_mode(True))
+                .add(EC.end_cmd())
+            )
+            .jump_to_label(EC.jump_back(0), 'loop')
+        )
+
+        offset = func.labels['obj']
+        obj_id = eot_script.append_empty_object()
+        eot_script.set_function(obj_id, 0, func)
+        offset += eot_script.get_function_start(obj_id, 0)
+
+        add_obj_complete(eot_script, offset, self,
+                         bucket_settings.num_objectives_needed,
+                         bucket_settings.objectives_win,
+                         objective_count_addr)
 
 
 class CollectNFragmentsObjective(Objective):

@@ -210,7 +210,29 @@ from .Rom import CTJoTProcedurePatch
 #            receive queue. Reproduced 2026-04-29 in a 12-player
 #            multiworld: zero fragments collected despite having
 #            fragment bucket objectives.
-__version__ = "1.4.8"
+#   1.4.9 -- fix: rock bucket-list objective false-completes under
+#            chronosanity. cjot-beta's ObtainNRocksObjective installed
+#            chest-id box-checks on rock-bearing chests; with AP
+#            routing chest contents, those box-checks fired on
+#            chest-open regardless of whether the AP-delivered item
+#            was actually a rock. Result (reported 2026-04-29):
+#            "Collect 4 Rocks" objective completed with 0 rocks in
+#            inventory after the player opened 4 chests that
+#            cjot-beta had originally placed rocks at.
+#            Replacement (Option 3 from analysis):
+#            - cjot-beta side: ObtainNRocksObjective.
+#              add_objective_check_to_ctrom rewritten to install a
+#              polling watchdog at End of Time obj 0 that checks
+#              0x7F003D >= num_rocks_needed and fires the
+#              obj-complete chain. One-shot flag at 0x7F003E
+#              prevents re-firing on EoT re-entry.
+#            - Client side: each game_watcher tick, count rock items
+#              (IDs 0xAE-0xB2) in inventory at 0x7E2400 and write the
+#              count to 0x7F003D via SNI. Watchdog now fires exactly
+#              when the player has actually collected the target
+#              number of rocks regardless of source (vanilla pickup,
+#              local AP placement, or cross-slot AP queue delivery).
+__version__ = "1.4.9"
 
 ctjot_logger = logging.getLogger("Jets of Time")
 
