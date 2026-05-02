@@ -232,7 +232,23 @@ from .Rom import CTJoTProcedurePatch
 #              when the player has actually collected the target
 #              number of rocks regardless of source (vanilla pickup,
 #              local AP placement, or cross-slot AP queue delivery).
-__version__ = "1.4.9"
+#   1.4.10 -- refinement of v1.4.8 fragment fix: pre-roll the
+#             bucket-list hint distribution to specific categories
+#             before deciding whether to add fragments to the AP item
+#             pool. v1.4.8 was over-conservative -- it added fragments
+#             whenever a fragment objective was POSSIBLE in any hint
+#             slot, even if no slot ended up rolling one. Result
+#             (reported 2026-04-29): user had Fragment items cluttering
+#             inventory in seeds where no fragment objective was
+#             actually selected.
+#             Now: _pre_roll_bucket_hints uses self.multiworld.random
+#             (seed-deterministic) to resolve each weighted hint
+#             string to one literal category. The resolved literals
+#             are mutated back into the option, so cjot-beta reads
+#             them at apply time and agrees with our roll. Fragments
+#             are added only if a collect_*_fragments_* objective is
+#             in the rolled list.
+__version__ = "1.4.10"
 
 ctjot_logger = logging.getLogger("Jets of Time")
 
@@ -346,37 +362,35 @@ class CTJoTWorld(World):
         # bucket_list mode + chronosanity ON: cjot-beta places fragments at
         # chests via bucketlist.py:write_fragments_to_config(), but with
         # chronosanity our apply_selective_placement overrides those chests
-        # with AP-routed items. Fragments effectively vanish from the
-        # multiworld unless we ALSO add them to the AP item pool here, so
-        # AP fill distributes them across the multiworld and other players
-        # opening the chests routes them back to us via the receive queue.
+        # with AP-routed items. Fragments need to be in the AP item pool
+        # so AP fill distributes them across the multiworld and other
+        # players opening chests routes them back to us via the receive
+        # queue.
         #
-        # Without this fix, a "Collect 10 of N Fragments" bucket-list
-        # objective is unreachable (no fragments ever arrive in inventory).
-        # Reproduced 2026-04-29 in user's seed: bucket_list on, chronosanity
-        # on, fragment objectives configured, zero fragments collected.
-        #
-        # Count: take the MAX fragment-total across all hint slots. cjot-beta
-        # picks one objective per slot from the weighted distribution at
-        # generate time; we don't know in advance which slots will land on
-        # fragment objectives, so we provision for the worst case. If no
-        # slot picks a fragment objective, the extra Fragment items in the
-        # pool are harmless (they go to other players' chests as filler).
-        # Skipped entirely when chronosanity is off (cjot-beta's local
-        # placement works correctly there).
+        # v1.4.10 refinement of v1.4.8: pre-roll the bucket-list hint
+        # distribution to specific categories using self.multiworld.random
+        # (seed-deterministic), then add fragments ONLY if a fragment
+        # objective was actually selected. Mutate the option value so
+        # cjot-beta sees the same literal selections at apply time
+        # (otherwise cjot-beta would re-roll with its own random and
+        # disagree with our fragment-add decision -- could leave fragments
+        # in the pool with no fragment objective, or vice-versa).
         if (
             bucket_list
             and bool(self.options.chronosanity.value)
             and game_mode != "Lost worlds"
         ):
+            self._pre_roll_bucket_hints()
+
             import re as _re_frag
-            hints = self.options.bucket_objective_hints.value or []
+            rolled_hints = self.options.bucket_objective_hints.value or []
             max_fragments = 0
-            for hint in hints:
-                for match in _re_frag.finditer(
-                    r'collect_(\d+)_fragments_(\d+)', str(hint)
-                ):
-                    total = int(match.group(2))
+            for hint in rolled_hints:
+                m = _re_frag.match(
+                    r'collect_(\d+)_fragments_(\d+)', str(hint).strip()
+                )
+                if m:
+                    total = int(m.group(2))
                     if total > max_fragments:
                         max_fragments = total
             for _ in range(max_fragments):
@@ -532,6 +546,59 @@ class CTJoTWorld(World):
         Overridden from World
         """
         return self.multiworld.random.choice(self._item_manager.get_junk_fill_items())
+
+    def _pre_roll_bucket_hints(self) -> None:
+        """Resolve weighted bucket-list hint distributions to literal categories.
+
+        cjot-beta accepts both weighted strings (e.g.,
+        ``"30:quest_gated, 50:boss_any"``) AND literal category names
+        (e.g., ``"quest_gated"``, ``"collect_10_fragments_20"``). When given
+        a weighted string, cjot-beta picks one entry using its OWN random
+        at apply time -- but we need to know the selection at create_items
+        time to decide whether fragments need to be added to the AP item
+        pool.
+
+        Solution: pre-roll using ``self.multiworld.random`` (seeded by AP)
+        and replace each weighted hint with the literal category we picked.
+        We mutate ``self.options.bucket_objective_hints.value`` so the
+        change persists into ``generate_output``, where
+        ``options_to_cli_args`` reads it and packs the resolved literals
+        into the .apctjot patch. cjot-beta then reads literals at apply
+        time and uses them as-is, agreeing with our pre-roll.
+
+        Hints without a ``:`` (e.g., the user picked a specific objective
+        like "Forge the Masamune") are left unchanged -- no roll needed.
+        """
+        raw = self.options.bucket_objective_hints.value or []
+        rolled: list[str] = []
+        rng = self.multiworld.random
+        for hint in raw:
+            text = str(hint).strip()
+            if ':' not in text:
+                rolled.append(text)
+                continue
+            parts = [p.strip() for p in text.split(',') if p.strip()]
+            weights: list[int] = []
+            categories: list[str] = []
+            for p in parts:
+                if ':' in p:
+                    weight_s, category = p.split(':', 1)
+                    try:
+                        w = int(weight_s.strip())
+                    except ValueError:
+                        continue
+                    if w <= 0:
+                        continue
+                    weights.append(w)
+                    categories.append(category.strip())
+                elif p:
+                    weights.append(1)
+                    categories.append(p)
+            if categories:
+                rolled.append(rng.choices(categories, weights=weights, k=1)[0])
+            else:
+                rolled.append(text)
+        self.options.bucket_objective_hints.value = rolled
 
     def fill_slot_data(self) -> dict:
         """Send per-slot YAML settings to the SNI Client over the AP wire.
