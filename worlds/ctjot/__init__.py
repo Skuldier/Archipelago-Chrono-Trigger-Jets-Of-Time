@@ -262,7 +262,27 @@ from .Rom import CTJoTProcedurePatch
 #               textbox command). When False, keeps the cheap shared-
 #               bytes path identical to 1.4.10. Static message string
 #               for v1; item-name substitution deferred to a v2.
-__version__ = "1.4.11"
+#   1.4.12 -- v2 of the item-arrival textbox: now displays the actual
+#             item name. New install_item_name_substitution pass claims
+#             chest text engine substitution sym 0x05 (jump table at
+#             0x025903 + 2*0x05). Handler reads the staged item ID from
+#             SCRIPT_STAGING_ADDR (0x7F03FC), multiplies by
+#             ITEM_NAME_SIZE (11), adds ITEM_NAMES_OFFSET base
+#             (0x0C0B5E), and tail-jumps to the engine's substring
+#             render continuation at 0xC25BF5. Uses the same
+#             trampoline pattern as install_conditional_chest_verb
+#             (real handler in bank 0x40-0x5F freespace + 4-byte JML
+#             trampoline at a small bank-0x02 free run + jump-table
+#             entry pointing at the trampoline).
+#             Receive hook string changed from static
+#             "* AP Item Received *" to raw bytes
+#             "Got <sym 0x05>!" so the player sees e.g. "Got Pendant!"
+#             when an AP item arrives. Caveat: claims sym 0x05 which
+#             is the encoder keyword `{linebreak+0}` -- any cjot-beta
+#             script that uses that keyword now invokes our handler
+#             instead. The more common `{line break}` (byte 0x06) is
+#             unaffected.
+__version__ = "1.4.12"
 
 ctjot_logger = logging.getLogger("Jets of Time")
 

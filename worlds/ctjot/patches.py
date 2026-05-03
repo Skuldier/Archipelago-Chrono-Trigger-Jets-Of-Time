@@ -588,10 +588,22 @@ def install_receive_hook(
     if not show_textbox and not silent_block_bytes:
         return {"successes": [], "failures": ["empty hook block"]}
 
-    # Static AP-arrival message. {null} terminates the CT string.
-    # Short to keep the textbox unobtrusive; one line, no item name yet
-    # (item-name substitution is queued for a v2 of this feature).
-    AP_ARRIVAL_MSG = "* AP Item Received *{null}"
+    # AP-arrival message: "Got <item name>!" using sym 0x05 substitution
+    # (set up by install_item_name_substitution). Built as raw CT-encoded
+    # bytes so the byte 0x05 stays as our substitution sym instead of
+    # being misinterpreted as the encoder keyword `{linebreak+0}`.
+    #
+    # Byte breakdown:
+    #   0xA6 = 'G'  (uppercase: 'A' is 0xA0, so 'A'+6='G')
+    #   0xC8 = 'o'  (lowercase: 'a' is 0xBA, 'a'+14='o')
+    #   0xCD = 't'  ('a'+19='t')
+    #   0xEF = ' '  (symbols start at 0xDE; ' ' is symbols[17])
+    #   0x05 = ITEM_NAME_SUB_SYMBOL (resolves to staged item's name)
+    #   0xDE = '!'  (symbols[0])
+    #   0x00 = null terminator
+    AP_ARRIVAL_MSG_BYTES = bytes([
+        0xA6, 0xC8, 0xCD, 0xEF, ITEM_NAME_SUB_SYMBOL, 0xDE, 0x00,
+    ])
 
     successes: list[str] = []
     failures: list[str] = []
@@ -615,9 +627,13 @@ def install_receive_hook(
             continue
         try:
             if show_textbox:
-                # Add the AP-arrival string to THIS script's string table
-                # so we can reference it via its script-local index.
-                msg_id = script.add_py_string(AP_ARRIVAL_MSG)
+                # Add the AP-arrival raw-byte string to THIS script's
+                # string table so we can reference it via its
+                # script-local index. Using add_string (raw bytearray)
+                # rather than add_py_string so byte 0x05 stays as our
+                # substitution sym instead of being interpreted as
+                # the `{linebreak+0}` encoder keyword.
+                msg_id = script.add_string(bytearray(AP_ARRIVAL_MSG_BYTES))
                 block_bytes = _build_receive_block(
                     textbox_string_id=msg_id
                 ).get_bytearray()
@@ -877,6 +893,14 @@ CHEST_STRING_OFFSET            = 0x1EFF0A
 SUBSTITUTION_JUMP_TABLE_BASE   = 0x025903   # entry stride is 2 bytes
 TEXT_ENGINE_CONTINUATION_ADDR  = 0xC25BF5   # bus address; same value chesttext.py jumps to
 VERB_SUB_SYMBOL                = 0x04       # vanilla jump-table entry points at default handler 0x594F
+# v1.4.12: sym 0x05 claimed for item-name substitution in the AP-arrival
+# textbox. Vanilla jump-table entry at 0x594F (no-op default, same as
+# our 0x04 slot before v1.2.x). Note: this overrides the encoder
+# keyword `{linebreak+0}` (also byte 0x05). cjot-beta scripts that use
+# `{linebreak+0}` would invoke our handler instead -- but the more
+# common linebreak keyword is `{line break}` (byte 0x06) which is
+# unaffected.
+ITEM_NAME_SUB_SYMBOL           = 0x05       # used by install_item_name_substitution
 
 # CT-encoded byte sequences. Encoding rules per
 # `_beta/sourcefiles/ctstrings.py`:
@@ -1119,6 +1143,102 @@ def install_conditional_chest_verb(ct_rom) -> None:
     rom.write(new_chest_string)
 
 
+def install_item_name_substitution(ct_rom) -> None:
+    """Install sym 0x05 substitution: read staged item ID, output its name.
+
+    Used by the v1.4.12 item-arrival textbox feature. The receive hook's
+    AP-arrival string contains byte 0x05 ("Got <0x05>!") -- when the
+    chest text engine processes that byte, it indirects through the
+    substitution jump table at 0x025903 + 2*0x05 to our handler. The
+    handler:
+
+      1. Reads the staged item ID from SCRIPT_STAGING_ADDR (0x7F03FC).
+         (The receive hook stages the head of the queue here right
+         before calling 0xC7. The byte stays put after 0xC7 returns,
+         so by the time the textbox renders, our staging address still
+         holds the just-delivered item ID.)
+      2. Multiplies the ID by ITEM_NAME_SIZE (11 bytes per name).
+      3. Adds the result to the item-name table base
+         (ITEM_NAMES_OFFSET = 0x0C0B5E) to compute the substring start
+         address. Stores it at the engine's expected fields
+         (0x0237/0x0239 for addr / bank, 0x023A for length).
+      4. Tail-jumps to TEXT_ENGINE_CONTINUATION_ADDR which inlines the
+         substring into the textbox render.
+
+    Implementation mirrors install_conditional_chest_verb's pattern:
+    real handler in bank 0x40-0x5F freespace + 4-byte JML trampoline at
+    a small bank-0x02 free run + jump-table entry pointing at the
+    trampoline.
+    """
+    from asm import assemble
+    from asm import instructions as inst
+    from asm.instructions import AddressingMode as AM
+    from asm.instructions import SpecialRegister as SR
+    import byteops
+    from freespace import FSWriteType  # type: ignore
+
+    rom = ct_rom.rom_data
+
+    item_name_bus = byteops.to_rom_ptr(ITEM_NAMES_OFFSET)
+
+    handler: list = [
+        # 1. Read item ID byte from our staging address.
+        inst.REP(0x20),                     # 16-bit accumulator
+        inst.LDA(SCRIPT_STAGING_ADDR, AM.LNG),
+        inst.AND(0x00FF, AM.IMM16),         # zero high byte (ID is 1 byte)
+        inst.SEP(0x20),                     # 8-bit accumulator
+
+        # 2. Multiply ID * ITEM_NAME_SIZE via SNES hardware multiplier.
+        inst.STA(SR.WRMPYA, AM.ABS),
+        inst.LDA(ITEM_NAME_SIZE, AM.IMM8),
+        inst.STA(SR.WRMPYB, AM.ABS),
+        inst.NOP(),                          # multiplier needs ~8 cycles
+        inst.CLC(),
+
+        # 3. Add to item-name table base, store as substring start addr.
+        inst.REP(0x20),
+        inst.LDA(SR.RDMPYL, AM.ABS),
+        inst.ADC(item_name_bus & 0xFFFF, AM.IMM16),
+        inst.STA(0x0237, AM.ABS),            # substring start addr (low 16)
+        inst.SEP(0x20),
+        inst.LDA(item_name_bus >> 16, AM.IMM8),
+        inst.STA(0x0239, AM.ABS),            # substring bank
+
+        # 4. Set substring length.
+        inst.LDA(ITEM_NAME_SIZE, AM.IMM8),
+        inst.STA(0x023A, AM.ABS),
+
+        # 5. Tail boilerplate (matches chesttext / install_conditional_chest_verb).
+        inst.LDA(0x01, AM.IMM8),
+        inst.STA(0x30, AM.DIR),
+        inst.LDA(0x00, AM.IMM8),
+        inst.XBA(),
+        inst.JMP(TEXT_ENGINE_CONTINUATION_ADDR, AM.LNG),
+    ]
+    handler_b = assemble.assemble(handler)
+
+    # Place handler in any freespace (typically bank 0x40-0x5F via _grant_freespace).
+    handler_addr = rom.space_manager.get_free_addr(len(handler_b))
+    rom.seek(handler_addr)
+    rom.write(handler_b, FSWriteType.MARK_USED)
+
+    # 4-byte JML trampoline in a bank-0x02 free run.
+    handler_bus = byteops.to_rom_ptr(handler_addr)
+    trampoline = bytes([
+        0x5C,                              # JML LNG opcode
+        handler_bus & 0xFF,
+        (handler_bus >> 8) & 0xFF,
+        (handler_bus >> 16) & 0xFF,
+    ])
+    trampoline_addr = _find_bank02_run(ct_rom, _TRAMPOLINE_SIZE)
+    rom.seek(trampoline_addr)
+    rom.write(trampoline)
+
+    # Patch jump-table entry for sym 0x05 to point at the trampoline.
+    rom.seek(SUBSTITUTION_JUMP_TABLE_BASE + 2 * ITEM_NAME_SUB_SYMBOL)
+    rom.write(int.to_bytes(trampoline_addr & 0xFFFF, 2, "little"))
+
+
 def rename_placeholder_items(ct_rom) -> None:
     """Rename each AP placeholder slot in CT's item-name table.
 
@@ -1255,6 +1375,13 @@ def apply_all_from_records(
     """
     placement_stats = apply_selective_placement_from_records(ct_rom, placements)
     apply_validation_marker(ct_rom, str(metadata.get("player_name", "") or ""))
+    # v1.4.12: when the item-arrival textbox is enabled, install the
+    # sym 0x05 item-name substitution handler BEFORE install_receive_hook
+    # adds strings that reference it. (Order matters only for clarity --
+    # both passes mutate disjoint regions, but installing the handler
+    # first matches the dependency direction.)
+    if metadata.get("item_arrival_textbox_enabled"):
+        install_item_name_substitution(ct_rom)
     hook_stats = install_receive_hook(
         ct_rom,
         show_textbox=bool(metadata.get("item_arrival_textbox_enabled")),
