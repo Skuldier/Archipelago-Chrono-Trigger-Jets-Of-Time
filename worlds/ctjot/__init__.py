@@ -282,7 +282,17 @@ from .Rom import CTJoTProcedurePatch
 #             script that uses that keyword now invokes our handler
 #             instead. The more common `{line break}` (byte 0x06) is
 #             unaffected.
-__version__ = "1.4.12"
+#   1.4.13 -- fix: 1.4.12 patch-apply failed with "Not enough free
+#             space. Size: 000037, hint: 000000" when the textbox
+#             toggle was on. Root cause: install_item_name_substitution
+#             ran BEFORE install_receive_hook in apply_all_from_records,
+#             but _grant_freespace (which marks bank 0x40-0x5F regions
+#             as available) was only called inside install_receive_hook.
+#             The 55-byte handler allocation failed because no
+#             freespace had been registered yet. Fix:
+#             install_item_name_substitution now calls _grant_freespace
+#             itself at start (idempotent — just marks long FF/00 runs).
+__version__ = "1.4.13"
 
 ctjot_logger = logging.getLogger("Jets of Time")
 

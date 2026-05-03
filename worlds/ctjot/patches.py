@@ -1177,6 +1177,14 @@ def install_item_name_substitution(ct_rom) -> None:
     import byteops
     from freespace import FSWriteType  # type: ignore
 
+    # _grant_freespace is idempotent (just marks long FF/00 runs in
+    # banks 0x40-0x5F as free) and we run BEFORE install_receive_hook
+    # in apply_all_from_records, so its freespace marking hasn't
+    # happened yet. Without this, get_free_addr below fails with
+    # "Not enough free space. Size: 000037, hint: 000000" because
+    # cjot-beta hasn't seen any free regions for our 55-byte handler.
+    _grant_freespace(ct_rom)
+
     rom = ct_rom.rom_data
 
     item_name_bus = byteops.to_rom_ptr(ITEM_NAMES_OFFSET)
