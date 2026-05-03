@@ -314,7 +314,35 @@ from .Rom import CTJoTProcedurePatch
 #             check for chest-text-engine context (a direct-page
 #             state byte that distinguishes engines). Pending
 #             research.
-__version__ = "1.4.14"
+#   1.4.15 -- full revert of v1.4.11-1.4.14 item-arrival-textbox
+#             feature. User reported (2026-05-01) that even with
+#             v1.4.14's static-message fallback, the textbox-on
+#             path was blocking item delivery entirely (items
+#             stopped arriving in-game). Rather than chase a third
+#             distinct failure mode in this code path, removed the
+#             feature wholesale and restored the v1.4.10 silent-
+#             delivery model:
+#             - Options.py: ItemArrivalTextbox class + dataclass
+#               entry removed.
+#             - __init__.py: item_arrival_textbox_enabled key
+#               removed from ap_metadata.json.
+#             - patches.py: install_receive_hook restored to its
+#               v1.4.10 single-shared-block form (no per-script
+#               variant, no show_textbox kwarg, no textbox 0xBB
+#               command in the drain pass). install_item_name_
+#               substitution function and ITEM_NAME_SUB_SYMBOL
+#               constant deleted (sym 0x05 jump table entry stays
+#               vanilla).
+#             - webapp: flag toggle, options.html row, yaml_emitter
+#               field, and test_yaml_generator case all removed.
+#             Existing patches that wrote item_arrival_textbox_
+#               enabled into ap_metadata still apply (1.4.15+ just
+#               ignores the key). YAMLs with the option still load
+#               (AP ignores unknown options at parse time).
+#             For a future revival, see Future Ideas.md and the
+#             v1.4.12-1.4.14 history above for the failure modes
+#             to avoid.
+__version__ = "1.4.15"
 
 ctjot_logger = logging.getLogger("Jets of Time")
 
@@ -737,10 +765,6 @@ class CTJoTWorld(World):
             "game_mode": str(getattr(self.options.game_mode, "value", "") or ""),
             "ap_classification_markers_enabled": bool(
                 getattr(getattr(self.options, "ap_classification_markers", None),
-                        "value", 0)
-            ),
-            "item_arrival_textbox_enabled": bool(
-                getattr(getattr(self.options, "item_arrival_textbox", None),
                         "value", 0)
             ),
         }
