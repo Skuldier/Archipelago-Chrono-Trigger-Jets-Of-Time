@@ -588,22 +588,21 @@ def install_receive_hook(
     if not show_textbox and not silent_block_bytes:
         return {"successes": [], "failures": ["empty hook block"]}
 
-    # AP-arrival message: "Got <item name>!" using sym 0x05 substitution
-    # (set up by install_item_name_substitution). Built as raw CT-encoded
-    # bytes so the byte 0x05 stays as our substitution sym instead of
-    # being misinterpreted as the encoder keyword `{linebreak+0}`.
+    # v1.4.14: REVERTED to v1.4.11's static message after v1.4.12-1.4.13
+    # found that overriding chest-text substitution sym 0x05 to inject
+    # an item-name substitution corrupted the menu / battle text engine
+    # (visible glitch: garbled "Battle ver. 2 / ACTIVE WAIT" status
+    # display + colored stripes after the textbox flag was on). Root
+    # cause: byte 0x05 in non-chest-text contexts is handled by a
+    # different engine layer than our handler assumed; the vanilla
+    # 0x594F "no-op" pointer at sym 0x05 was actually context-aware,
+    # and our naive override stomps menu/battle engine state.
     #
-    # Byte breakdown:
-    #   0xA6 = 'G'  (uppercase: 'A' is 0xA0, so 'A'+6='G')
-    #   0xC8 = 'o'  (lowercase: 'a' is 0xBA, 'a'+14='o')
-    #   0xCD = 't'  ('a'+19='t')
-    #   0xEF = ' '  (symbols start at 0xDE; ' ' is symbols[17])
-    #   0x05 = ITEM_NAME_SUB_SYMBOL (resolves to staged item's name)
-    #   0xDE = '!'  (symbols[0])
-    #   0x00 = null terminator
-    AP_ARRIVAL_MSG_BYTES = bytes([
-        0xA6, 0xC8, 0xCD, 0xEF, ITEM_NAME_SUB_SYMBOL, 0xDE, 0x00,
-    ])
+    # Static message keeps the textbox feature usable without the
+    # corruption risk. v3 work for dynamic item names would need a
+    # context-aware handler (early-return when not in chest-text
+    # engine state) -- documented in the changelog.
+    AP_ARRIVAL_MSG = "* AP Item Received *{null}"
 
     successes: list[str] = []
     failures: list[str] = []
@@ -627,13 +626,13 @@ def install_receive_hook(
             continue
         try:
             if show_textbox:
-                # Add the AP-arrival raw-byte string to THIS script's
-                # string table so we can reference it via its
-                # script-local index. Using add_string (raw bytearray)
-                # rather than add_py_string so byte 0x05 stays as our
-                # substitution sym instead of being interpreted as
-                # the `{linebreak+0}` encoder keyword.
-                msg_id = script.add_string(bytearray(AP_ARRIVAL_MSG_BYTES))
+                # Add the AP-arrival string to THIS script's string
+                # table so we can reference it via its script-local
+                # index. Using add_py_string with the static
+                # "* AP Item Received *" message after v1.4.14
+                # reverted the v1.4.12-1.4.13 dynamic-name attempt --
+                # see comment on AP_ARRIVAL_MSG above.
+                msg_id = script.add_py_string(AP_ARRIVAL_MSG)
                 block_bytes = _build_receive_block(
                     textbox_string_id=msg_id
                 ).get_bytearray()
@@ -1144,7 +1143,25 @@ def install_conditional_chest_verb(ct_rom) -> None:
 
 
 def install_item_name_substitution(ct_rom) -> None:
-    """Install sym 0x05 substitution: read staged item ID, output its name.
+    """[v1.4.14: NOT CURRENTLY CALLED -- kept for future reference.]
+
+    The v1.4.12-v1.4.13 attempt to use this for dynamic item-name display
+    in the AP-arrival textbox broke the menu / battle text engine. Byte
+    0x05 in non-chest-text contexts is handled by a different engine
+    layer than this handler assumes; the vanilla pointer at sym 0x05
+    (0x594F) was actually context-aware, and our naive override stomps
+    state when byte 0x05 appears in any non-chest-text string (battle
+    status overlays, menu text, etc.) -- producing visible corruption
+    like garbled "Battle ver. 2 / ACTIVE WAIT" displays + striped tiles.
+
+    For a v3 to revive this, the handler would need to early-return
+    when not in chest-text engine state (probably gated on a specific
+    direct-page state byte that distinguishes engines). Documented as
+    pending research; not safe to enable as-is.
+
+    Original docstring follows:
+
+    Install sym 0x05 substitution: read staged item ID, output its name.
 
     Used by the v1.4.12 item-arrival textbox feature. The receive hook's
     AP-arrival string contains byte 0x05 ("Got <0x05>!") -- when the
@@ -1383,13 +1400,11 @@ def apply_all_from_records(
     """
     placement_stats = apply_selective_placement_from_records(ct_rom, placements)
     apply_validation_marker(ct_rom, str(metadata.get("player_name", "") or ""))
-    # v1.4.12: when the item-arrival textbox is enabled, install the
-    # sym 0x05 item-name substitution handler BEFORE install_receive_hook
-    # adds strings that reference it. (Order matters only for clarity --
-    # both passes mutate disjoint regions, but installing the handler
-    # first matches the dependency direction.)
-    if metadata.get("item_arrival_textbox_enabled"):
-        install_item_name_substitution(ct_rom)
+    # v1.4.14: install_item_name_substitution is NOT called -- it
+    # remains in patches.py for future reference but reverting v1.4.12-
+    # v1.4.13 means sym 0x05's vanilla jump-table entry stays in place.
+    # Replacing it broke the menu / battle text engine; see comment on
+    # AP_ARRIVAL_MSG in install_receive_hook for details.
     hook_stats = install_receive_hook(
         ct_rom,
         show_textbox=bool(metadata.get("item_arrival_textbox_enabled")),

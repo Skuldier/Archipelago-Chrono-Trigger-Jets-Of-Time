@@ -292,7 +292,29 @@ from .Rom import CTJoTProcedurePatch
 #             freespace had been registered yet. Fix:
 #             install_item_name_substitution now calls _grant_freespace
 #             itself at start (idempotent — just marks long FF/00 runs).
-__version__ = "1.4.13"
+#   1.4.14 -- revert v1.4.12-1.4.13's dynamic-item-name attempt.
+#             v1.4.12 claimed chest-text-engine substitution sym 0x05
+#             to inject the staged item's name into the AP-arrival
+#             textbox ("Got Pendant!"). Tested by the user post-patch:
+#             the menu / battle text engine got corrupted -- visible
+#             glitch was a garbled "Battle ver. 2 / ACTIVE WAIT"
+#             status overlay + colored stripes after the textbox flag
+#             was on. Root cause: byte 0x05 in non-chest-text contexts
+#             (battle status, menus) is handled by a different engine
+#             layer than our handler assumed; the vanilla 0x594F
+#             "no-op" pointer at sym 0x05 was actually context-aware
+#             (likely linebreak in menu engine, no-op in chest text
+#             engine), and our naive override stomps state when byte
+#             0x05 appears in any non-chest-text string.
+#             Fix: revert to v1.4.11's static "* AP Item Received *"
+#             message. install_item_name_substitution stays defined
+#             but uncalled (kept for future reference); sym 0x05 jump
+#             table entry stays vanilla. For a v3 to revive dynamic
+#             item names, the handler would need an early-return
+#             check for chest-text-engine context (a direct-page
+#             state byte that distinguishes engines). Pending
+#             research.
+__version__ = "1.4.14"
 
 ctjot_logger = logging.getLogger("Jets of Time")
 
