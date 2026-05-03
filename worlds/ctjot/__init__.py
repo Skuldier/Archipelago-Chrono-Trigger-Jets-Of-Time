@@ -248,7 +248,21 @@ from .Rom import CTJoTProcedurePatch
 #             them at apply time and agrees with our roll. Fragments
 #             are added only if a collect_*_fragments_* objective is
 #             in the rolled list.
-__version__ = "1.4.10"
+#   1.4.11 -- feature: optional item-arrival textbox. New ItemArrivalTextbox
+#             toggle (default OFF, matches pre-1.4.11 silent delivery).
+#             When ON, the receive hook injects a personal-textbox
+#             command (0xBB) after each 0xC7 add-item, displaying
+#             "* AP Item Received *" in-game. Implementation:
+#             - Options.py: new ItemArrivalTextbox toggle in dataclass
+#             - __init__.py generate_output: writes
+#               item_arrival_textbox_enabled into ap_metadata.json
+#             - patches.py: install_receive_hook gains a show_textbox
+#               kwarg; when True, builds the receive block per-script
+#               (so each script's added string ID can be baked into the
+#               textbox command). When False, keeps the cheap shared-
+#               bytes path identical to 1.4.10. Static message string
+#               for v1; item-name substitution deferred to a v2.
+__version__ = "1.4.11"
 
 ctjot_logger = logging.getLogger("Jets of Time")
 
@@ -671,6 +685,10 @@ class CTJoTWorld(World):
             "game_mode": str(getattr(self.options.game_mode, "value", "") or ""),
             "ap_classification_markers_enabled": bool(
                 getattr(getattr(self.options, "ap_classification_markers", None),
+                        "value", 0)
+            ),
+            "item_arrival_textbox_enabled": bool(
+                getattr(getattr(self.options, "item_arrival_textbox", None),
                         "value", 0)
             ),
         }

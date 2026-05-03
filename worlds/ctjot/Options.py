@@ -303,6 +303,17 @@ class APClassificationMarkers(Toggle):
     default = 1
 
 
+class ItemArrivalTextbox(Toggle):
+    """Show an in-game textbox when an AP item arrives in your inventory.
+
+    When ON, the receive hook displays a "* AP Item Received *" textbox
+    after each item delivered from the multiworld queue. Up to 4
+    textboxes may pop up in a row on a busy map transition (one per
+    item drained). Default is OFF (silent delivery, matches pre-1.4.11
+    behavior)."""
+    display_name = "Item Arrival Textbox"
+
+
 # --- Extra flags ---
 
 class StartersSufficient(Toggle):
@@ -810,6 +821,7 @@ class CTJoTOptions(PerGameCommonOptions):
     free_menu_glitch: FreeMenuGlitch
     visible_techlist: VisibleTechlist
     ap_classification_markers: APClassificationMarkers
+    item_arrival_textbox: ItemArrivalTextbox
     # Extra
     starters_sufficient: StartersSufficient
     tech_damage_rando: TechDamageRando

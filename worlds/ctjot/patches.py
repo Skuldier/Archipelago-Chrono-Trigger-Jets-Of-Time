@@ -466,8 +466,16 @@ _SCRIPT_SHIFT_TMP = 0x7F03FA   # script-memory bounce slot for shifts
 _SCRIPT_COUNT_OFFSET = (_SCRIPT_COUNT_TMP - 0x7F0200) // 2  # for opcode 0x73
 
 
-def _build_receive_block():
+def _build_receive_block(textbox_string_id: int | None = None):
     """Construct the queue-drain block injected at every map's obj 0 fn 0.
+
+    `textbox_string_id` is an optional script-local string index. When
+    provided, a personal-textbox command (opcode 0xBB) is appended after
+    each 0xC7 add-item so the player gets an in-game notification that
+    something arrived from the multiworld. The string at that index is
+    expected to be the AP-arrival message (e.g. "* AP Item Received *");
+    install_receive_hook adds it to each script's string table when the
+    item-arrival-textbox option is enabled.
 
     Up to AP_QUEUE_CAPACITY items drain per map transition. The flow:
       0. Bounce the WRAM queue count into _SCRIPT_COUNT_TMP once.
@@ -521,6 +529,13 @@ def _build_receive_block():
         body.add(EC.assign_mem_to_mem(queue_slots[0], SCRIPT_STAGING_ADDR, 1))
         # 2. Add it to inventory via vanilla command 0xC7.
         body.add(EC.generic_one_arg(0xC7, RECEIVE_ITEM_OFFSET_BYTE))
+        # 2a. Optional in-game notification (item-arrival-textbox flag).
+        # Personal textbox (0xBB) closes when the player walks away --
+        # non-blocking enough to be acceptable mid-gameplay. With up to
+        # AP_QUEUE_CAPACITY items per drain, the player can get up to 4
+        # textboxes in a row on a busy map transition.
+        if textbox_string_id is not None:
+            body.add(EC.generic_one_arg(0xBB, textbox_string_id))
         # 3. Shift slots down: slot[i] -> slot[i-1] for i in [1..N-1].
         #    Each shift bounces WRAM -> script -> WRAM.
         for i in range(1, len(queue_slots)):
@@ -544,15 +559,39 @@ def _build_receive_block():
     return full
 
 
-def install_receive_hook(ct_rom) -> dict[str, list[str]]:
-    """Inject the polling block into every LocID's obj 0 fn 0."""
+def install_receive_hook(
+    ct_rom,
+    show_textbox: bool = False,
+) -> dict[str, list[str]]:
+    """Inject the polling block into every LocID's obj 0 fn 0.
+
+    `show_textbox` toggles the v1.4.11 item-arrival-textbox feature.
+    When True, each script gets the AP-arrival message string added to
+    its string table at install time, and the receive block is built
+    per-script with that string ID baked into a 0xBB textbox command
+    after each 0xC7 add-item. When False (default), the receive block
+    is built once and reused -- no per-script string allocation, no
+    textbox commands, identical to the silent-delivery behavior of
+    1.4.10 and earlier.
+    """
     import ctenums
 
     _grant_freespace(ct_rom)
 
-    block_bytes = _build_receive_block().get_bytearray()
-    if not block_bytes:
+    # Pre-build the silent block once if the textbox feature is off,
+    # so we keep the cheap shared-bytes path for the common case.
+    silent_block_bytes = (
+        _build_receive_block().get_bytearray()
+        if not show_textbox
+        else b""
+    )
+    if not show_textbox and not silent_block_bytes:
         return {"successes": [], "failures": ["empty hook block"]}
+
+    # Static AP-arrival message. {null} terminates the CT string.
+    # Short to keep the textbox unobtrusive; one line, no item name yet
+    # (item-name substitution is queued for a v2 of this feature).
+    AP_ARRIVAL_MSG = "* AP Item Received *{null}"
 
     successes: list[str] = []
     failures: list[str] = []
@@ -575,6 +614,15 @@ def install_receive_hook(ct_rom) -> dict[str, list[str]]:
             failures.append(f"{member.name}: script is None")
             continue
         try:
+            if show_textbox:
+                # Add the AP-arrival string to THIS script's string table
+                # so we can reference it via its script-local index.
+                msg_id = script.add_py_string(AP_ARRIVAL_MSG)
+                block_bytes = _build_receive_block(
+                    textbox_string_id=msg_id
+                ).get_bytearray()
+            else:
+                block_bytes = silent_block_bytes
             fn_start = script.get_function_start(0, 0)
             script.insert_commands(block_bytes, fn_start)
             successes.append(member.name)
@@ -1207,7 +1255,10 @@ def apply_all_from_records(
     """
     placement_stats = apply_selective_placement_from_records(ct_rom, placements)
     apply_validation_marker(ct_rom, str(metadata.get("player_name", "") or ""))
-    hook_stats = install_receive_hook(ct_rom)
+    hook_stats = install_receive_hook(
+        ct_rom,
+        show_textbox=bool(metadata.get("item_arrival_textbox_enabled")),
+    )
     rename_placeholder_items(ct_rom)
     install_conditional_chest_verb(ct_rom)
     rock_flags_stats = install_rock_pickup_flags(ct_rom)
