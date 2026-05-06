@@ -15,11 +15,20 @@ from .Options import CTJoTOptions
 from .Rom import CTJoTProcedurePatch
 
 # Apworld version.
-#   1.0.0 -- first release of the procedure-patch / romless
-#            generation architecture: generator emits JSON-only
-#            .apctjot, players apply against their own ROM via the
-#            bundled cjot-beta snapshot at worlds/ctjot/_beta/. See
-#            _beta/SNAPSHOT.txt for the cjot-beta source identity.
+#
+# Note: the version string was reset to 1.0.0 on 2026-05-03 to mark the
+# first PUBLIC GitHub Release. The entries below labeled v1.0.0-v1.4.15
+# are the internal development cycle (private fork-syncs, no public
+# tags) and are preserved as historical record. The "1.0.0 (internal
+# milestone)" entry just below was the first procedure-patch build
+# during private dev; the live __version__ at the bottom of this
+# changelog ("1.0.0") refers to the public release that supersedes it.
+#
+#   1.0.0 (internal milestone) -- first release of the procedure-patch
+#            / romless generation architecture: generator emits
+#            JSON-only .apctjot, players apply against their own ROM
+#            via the bundled cjot-beta snapshot at worlds/ctjot/_beta/.
+#            See _beta/SNAPSHOT.txt for the cjot-beta source identity.
 #   1.1.0 -- per-classification chest placeholders. Cross-slot
 #            chests now display "Got 1 AP Trap" / "Got 1 AP Key" /
 #            "Got 1 AP Useful" / "Got 1 AP Filler" instead of a
@@ -342,7 +351,21 @@ from .Rom import CTJoTProcedurePatch
 #             For a future revival, see Future Ideas.md and the
 #             v1.4.12-1.4.14 history above for the failure modes
 #             to avoid.
-__version__ = "1.4.15"
+#   1.0.0 (PUBLIC RELEASE 2026-05-03) -- first public GitHub Release.
+#             Consolidates the v1.0.0-v1.4.15 internal iteration cycle
+#             (see entries above) into a stable 1.0.0 public version.
+#             Functionally identical to the v1.4.15 internal build:
+#             receive-hook FIFO + SRAM-persistent counter (Phase A),
+#             classification-marker NPCs above chests, conditional
+#             chest verb, fragment objective + bucket pre-roll, all
+#             game-mode and KI-flag plumbing. Item-arrival-textbox
+#             feature was attempted in v1.4.11-v1.4.14 internal and
+#             reverted in v1.4.15 internal — see Future Ideas.md #17
+#             for the failure history. The version-string reset is
+#             a release-engineering decision, not a behavioral break:
+#             v1.4.15-internal patches and 1.0.0-public patches are
+#             schema-compatible.
+__version__ = "1.0.0"
 
 ctjot_logger = logging.getLogger("Jets of Time")
 
